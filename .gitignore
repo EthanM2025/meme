@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# M5StopWatch-UserDemo (vendored LVGL/M5GFX/etc — clone separately, see README)
+userdemo/
+
+# ESP-IDF firmware (mic-test/)
+mic-test/build/
+mic-test/managed_components/
+mic-test/dependencies.lock
+mic-test/sdkconfig
+mic-test/sdkconfig.bak
+mic-test/sdkconfig*[0-9]
+!mic-test/sdkconfig.defaults
+
+# Mac server (mac-server/)
+mac-server/.env
+mac-server/captures/
+mac-server/__pycache__/
+mac-server/*.pyc
+
+# Generic
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.log
+*.bak

@@ -1,0 +1,26 @@
+# From M5StopWatch-UserDemo/sdkconfig.defaults — known-good for the board.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FREERTOS_HZ=1000
+
+# Bigger app partition for LVGL + M5GFX.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Enable extra Montserrat font sizes via LVGL Kconfig (lv_conf.h discovery
+# was unreliable, so we set things explicitly here).
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_36=y
+
+# Required by our generated CJK font (lv_font_cjk_14.c):
+#   - LV_USE_FONT_COMPRESSED: the font uses bitmap_format=1 (RLE-compressed glyphs)
+#   - LV_FONT_FMT_TXT_LARGE:  font has ~21k glyphs, exceeds the small offset table format
+CONFIG_LV_USE_FONT_COMPRESSED=y
+CONFIG_LV_FONT_FMT_TXT_LARGE=y
