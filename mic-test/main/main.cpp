@@ -20,11 +20,11 @@
 #include "display.h"
 #include "mdns.h"
 
-// Mac-side WebSocket server. We resolve the Mac by its mDNS hostname so the
-// device follows the Mac across network changes — no reflash needed when DHCP
-// hands out a new IP. The hostname is what `scutil --get LocalHostName` prints
-// on the Mac (System Settings → Sharing → Local Hostname). Edit if you rename
-// your Mac.
+// === EDIT THIS LINE FOR YOUR MAC ===
+// We resolve the Mac by its mDNS hostname so the device follows it across
+// WiFi/DHCP changes — no reflash needed when the Mac IP rotates. The hostname
+// is what `scutil --get LocalHostName` prints on your Mac
+// (System Settings → General → Sharing → Local hostname).
 #define MAC_WS_URI "ws://Ethan-MacBook-Air.local:8765/"
 
 static const char* TAG = "mic-test";

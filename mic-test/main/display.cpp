@@ -3,7 +3,8 @@
 //   - Panel_CO5300 (QSPI, 468x466 visible area on a 480x480 buffer, 6px x-offset)
 //   - M5GFX wraps the bus + panel into one drawable handle
 //   - LVGL gets a partial render buffer in PSRAM; flush_cb pushes pixels via M5GFX
-//   - CST820 touch is read in lvgl_read_cb (TODO once we have a CST820 driver)
+//   - CST820 touch is wired through `touch_read_cb` into an LVGL pointer indev,
+//     with gesture events on each screen mapped to swipe-page transitions.
 
 #include "display.h"
 

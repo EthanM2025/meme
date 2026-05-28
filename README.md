@@ -66,13 +66,8 @@ Needs Python 3.9+ and a Doubao (Volcengine) speech key.
 cd mac-server
 pip3 install websockets aiohttp python-dotenv
 
-cat > .env <<'EOF'
-DOUBAO_API_KEY=<your key>
-DOUBAO_APP_ID=<your app id>
-DOUBAO_RESOURCE_ID=volc.seedasr.auc
-DOUBAO_STREAMING_RESOURCE_ID=volc.seedasr.sauc.duration
-DOUBAO_STREAMING_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
-EOF
+cp .env.example .env
+# then edit .env and fill in your Doubao API key + app id
 
 ./run_server.sh
 ```
@@ -81,7 +76,19 @@ The server listens on `ws://0.0.0.0:8765/` and prints incoming connections, ASR 
 
 ### 2. Firmware
 
-Needs ESP-IDF v5.5+ on macOS. Edit `mic-test/main/main.cpp` and set `MAC_WS_URI` to your Mac's IP (e.g. `ws://192.168.10.78:8765/`).
+Needs ESP-IDF v5.5+ on macOS.
+
+Edit one line in `mic-test/main/main.cpp` — set `MAC_WS_URI` to your Mac's
+mDNS hostname:
+
+```c
+#define MAC_WS_URI "ws://<YourMacName>.local:8765/"
+```
+
+Get the hostname with `scutil --get LocalHostName` on your Mac, or check
+**System Settings → General → Sharing → Local hostname**. Because we resolve
+via mDNS, the device follows your Mac across WiFi changes and DHCP IP
+rotations — only reflash if you rename your Mac.
 
 ```bash
 cd mic-test
@@ -103,6 +110,10 @@ Credentials are stored in NVS.
 - **OPI PSRAM is required** — `sdkconfig.defaults` sets `CONFIG_SPIRAM_MODE_OCT=y`. Arduino board target's default is QSPI and breaks display init.
 - **M5IOE1 is at I²C address `0x4F`** (not `0x6F` as M5GFX 0.2.21 thinks). The vendored `userdemo/components/M5GFX` has the fix.
 - ES8311 codec is on the same I²C bus + I2S DIN/DOUT, mic enabled via the M5IOE1 power rail pin.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgements
 
