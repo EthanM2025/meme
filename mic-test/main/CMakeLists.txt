@@ -4,5 +4,5 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES driver esp_codec_dev M5IOE1 M5PM1 M5GFX lvgl json
              nvs_flash esp_wifi esp_netif esp_event esp_http_server
-             esp_websocket_client
+             esp_websocket_client mdns
 )

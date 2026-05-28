@@ -18,9 +18,14 @@
 #include "ws_client.h"
 #include "buttons.h"
 #include "display.h"
+#include "mdns.h"
 
-// Mac-side WebSocket server. v1 hardcoded; later move to NVS / SoftAP config.
-#define MAC_WS_URI "ws://192.168.10.78:8765/"
+// Mac-side WebSocket server. We resolve the Mac by its mDNS hostname so the
+// device follows the Mac across network changes — no reflash needed when DHCP
+// hands out a new IP. The hostname is what `scutil --get LocalHostName` prints
+// on the Mac (System Settings → Sharing → Local Hostname). Edit if you rename
+// your Mac.
+#define MAC_WS_URI "ws://Ethan-MacBook-Air.local:8765/"
 
 static const char* TAG = "mic-test";
 
@@ -337,6 +342,16 @@ extern "C" void app_main() {
     init_i2s();
     init_codec();
     buttons_init();
+
+    // Enable mDNS so the lwIP resolver can turn `.local` hostnames into IPs.
+    // Without this, `gethostbyname("Ethan-MacBook-Air.local")` fails and the
+    // WS client can't connect.
+    if (mdns_init() == ESP_OK) {
+        mdns_hostname_set("meme");        // device is now reachable as meme.local
+        mdns_instance_name_set("Meme handheld");
+    } else {
+        ESP_LOGW(TAG, "mdns_init failed — .local hostname won't resolve");
+    }
 
     ws_start(MAC_WS_URI);
     note_activity();
