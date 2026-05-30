@@ -1,5 +1,7 @@
 # Meme — voice-input handheld for AI coding agents
 
+*[中文文档](README.zh-CN.md)*
+
 A press-to-talk pixel companion that turns the [M5Stack StopWatch](https://docs.m5stack.com/en/core/StopWatch) into a desk-mate for Claude Code / Codex / Cursor / any text-input AI agent.
 
 **Hold the side button, speak, release.** Your speech streams over WiFi to a tiny Mac server, gets transcribed by Doubao streaming ASR, and is auto-pasted into whatever window has focus — Claude Code, Codex, VS Code, Slack, your editor. The other button sends Enter. Meanwhile the round AMOLED shows live state from your coding session: which model, output tokens, API-equivalent cost, a per-todo dot matrix, today's Codex.app focus time, and a pixel mascot reacting to whether you're recording.
