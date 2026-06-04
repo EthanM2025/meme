@@ -29,6 +29,17 @@ void ui_set_model(const char* model);
 
 // Claude page metrics (tokens out, estimated cost USD, busy/idle state).
 void ui_set_claude_metrics(int tokens_out, float cost_usd, bool busy);
+
+// Claude page 5h / 7d Anthropic-window quota (from api.anthropic.com/api/oauth/usage).
+// `five_h_used_pct` < 0 (or -1) means "no data" — UI shows "--%".
+// Reset args are ABSOLUTE clock strings ("23:00" or "6/9 09:00").
+void ui_set_claude_quota(int five_h_used_pct, const char* five_h_reset_abs,
+                         int seven_d_used_pct, const char* seven_d_reset_abs);
+
+// Claude page bottom summary line — today's cost, output tokens, Mac local HH:MM.
+void ui_set_claude_summary(float today_cost_usd, int today_tokens, const char* hhmm);
+// Codex page arc fill value (EFFORT = HIGH/MED/LOW mapped to %).
+void ui_set_codex_effort_arc(int effort_pct);
 void ui_set_codex_model(const char* model);
 void ui_set_codex_effort(const char* effort);  // "high" / "medium" / "low" or ""
 void ui_set_todos_progress(int done, int total, const char* current, const char* recent_done);

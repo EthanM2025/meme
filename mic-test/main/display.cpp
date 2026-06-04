@@ -24,6 +24,12 @@
 #include "codex_pet_assets.h"
 #include "claude_pet_assets.h"
 #include "i2c_bus.h"
+#include "kitty_pet_assets.h"
+#include "esp_random.h"
+
+// 48x48 RGB565 brand logos from alexjc-tech/cc-island.
+extern "C" const lv_image_dsc_t logo_claude;
+extern "C" const lv_image_dsc_t logo_codex;
 
 // CJK font removed — Chinese rendering wasn't worth the ~1.7MB it took in
 // the app partition. Transcript label now uses Montserrat; Chinese ASR output
@@ -126,26 +132,46 @@ static lv_display_t* s_lv_disp = nullptr;
 static std::unique_ptr<Cst820> s_touch;
 static volatile bool s_touch_activity = false;
 
-// Two screens: Claude (default) and Codex. Swipe left → Codex, right → Claude.
-static lv_obj_t* s_scr_claude = nullptr;
-static lv_obj_t* s_scr_codex  = nullptr;
+// Screens form a "cross": Claude ↔ Codex horizontally.
+//   swipe UP   from a main → Dashboard (data summary)
+//   swipe DOWN from a main → Pet (just a kitten animation, no UI chrome)
+//   on Dashboard / Pet, the inverse swipe returns to whichever main we came from.
+static lv_obj_t* s_scr_claude    = nullptr;
+static lv_obj_t* s_scr_codex     = nullptr;
+static lv_obj_t* s_scr_dashboard = nullptr;
+static lv_obj_t* s_scr_pet       = nullptr;
+static lv_obj_t* s_last_main     = nullptr;   // tracks claude/codex; updated when we leave a main
 // Setup screen — only shown while SoftAP provisioning is active.
 static lv_obj_t* s_scr_setup  = nullptr;
+
+// Hard-coded daily token cap for API-key users (no real quota endpoint).
+// Used to derive the "X% remaining" on the dashboard's Claude half.
+static constexpr int CLAUDE_DAILY_TOKEN_CAP = 3000000;
 static lv_obj_t* s_setup_ssid_label = nullptr;
 static lv_obj_t* s_setup_url_label  = nullptr;
 
-// Claude-page widgets — mirrors Codex page layout (two-arc header + metric
-// rows + bottom todo block).
+// Claude-page widgets.
+//   Title:     [logo] "Claude"
+//   Arcs:      MODEL (model name) + STATUS (BUSY/IDLE)
+//   Bars:      5H + 7D quota in mockup style (label/reset above thin bar,
+//              filled by REMAINING percent)
+//   TodoList:  X / Y + dot matrix
+//   Summary:   "今日 $X X.XK Token HH:MM"
 static lv_obj_t* s_rec_dot = nullptr;
-static lv_obj_t* s_model_value = nullptr;        // left arc: model name (e.g. "opus-4.7")
-static lv_obj_t* s_mode_value = nullptr;         // right arc: "BUSY" / "IDLE"
-static lv_obj_t* s_out_value = nullptr;          // OUT row text "1.8K"
-static lv_obj_t* s_out_pct_label = nullptr;
-static lv_obj_t* s_out_bar = nullptr;
-static lv_obj_t* s_cost_value = nullptr;         // COST row text "$1.23"
-static lv_obj_t* s_cost_pct_label = nullptr;
-static lv_obj_t* s_cost_bar = nullptr;
-static lv_obj_t* s_todos_label = nullptr;        // bottom: "X / Y" centered
+static lv_obj_t* s_model_value      = nullptr;   // left arc center: model short name
+static lv_obj_t* s_mode_value       = nullptr;   // right arc center: BUSY / IDLE
+static lv_obj_t* s_claude_model_arc = nullptr;   // left arc fill (decorative now)
+static lv_obj_t* s_claude_mode_arc  = nullptr;   // right arc fill (decorative now)
+// Claude page uses TODAY $ / TOKENS rows instead of 5H/7D quota bars.
+// Subscription-only OAuth users have quota; API-key users don't, and that's the common case.
+static lv_obj_t* s_claude_today_label  = nullptr;
+static lv_obj_t* s_claude_today_leader = nullptr;   // thin gray line, width adjusted to abut value
+static lv_obj_t* s_claude_today_value  = nullptr;   // "$3.50" big number, right
+static lv_obj_t* s_claude_tokens_label = nullptr;
+static lv_obj_t* s_claude_tokens_leader = nullptr;
+static lv_obj_t* s_claude_tokens_value = nullptr;   // "12.5K" big number, right
+static lv_obj_t* s_todos_label      = nullptr;   // "X / Y" centered
+static lv_obj_t* s_claude_summary   = nullptr;   // bottom summary line
 static lv_obj_t* s_transcript_label = nullptr;
 // Battery indicator — one label per screen, both updated from one setter.
 static lv_obj_t* s_battery_claude = nullptr;
@@ -169,18 +195,34 @@ static lv_obj_t* s_codex_actweek_pct   = nullptr;
 static lv_obj_t* s_codex_rec_dot = nullptr;
 static lv_obj_t* s_codex_model_value = nullptr;
 static lv_obj_t* s_codex_effort_value = nullptr;   // "HIGH"/"MEDIUM"/"LOW" in right arc
-static lv_obj_t* s_codex_5h_value = nullptr;       // "X% used" text, 5H row
-static lv_obj_t* s_codex_5h_pct_label = nullptr;  // right-side "X%", 5H row
-static lv_obj_t* s_codex_5h_bar = nullptr;
-static lv_obj_t* s_codex_week_value = nullptr;     // "X% used" text, WEEK row
-static lv_obj_t* s_codex_week_pct_label = nullptr; // right-side "X%", WEEK row
-static lv_obj_t* s_codex_week_bar = nullptr;
+static lv_obj_t* s_codex_model_arc  = nullptr;     // left arc fill — now 5h remaining %
+static lv_obj_t* s_codex_effort_arc = nullptr;     // right arc fill — now 7d remaining %
+static lv_obj_t* s_codex_5h_label = nullptr;       // "5H" big label
+static lv_obj_t* s_codex_5h_pct   = nullptr;       // big "X%" number, right
+static lv_obj_t* s_codex_5h_reset = nullptr;       // small "reset HH:MM" above bar
+static lv_obj_t* s_codex_5h_bar   = nullptr;
+static lv_obj_t* s_codex_7d_label = nullptr;
+static lv_obj_t* s_codex_7d_pct   = nullptr;
+static lv_obj_t* s_codex_7d_reset = nullptr;
+static lv_obj_t* s_codex_7d_bar   = nullptr;
 static lv_obj_t* s_codex_pet_img = nullptr;
 static lv_timer_t* s_codex_pet_timer = nullptr;
 static uint8_t s_codex_pet_frame = 0;
 static const lv_image_dsc_t* const* s_codex_pet_frames = codex_pet_idle_frames;
 static const uint32_t* s_codex_pet_durations = codex_pet_idle_durations_ms;
 static uint8_t s_codex_pet_frame_count = CODEX_PET_IDLE_FRAME_COUNT;
+
+// Dashboard widgets — Claude top half + Codex bottom half + bottom clock.
+static lv_obj_t* s_dash_claude_big       = nullptr;   // "67%" big
+static lv_obj_t* s_dash_claude_token_bar = nullptr;
+static lv_obj_t* s_dash_claude_token_rst = nullptr;
+static lv_obj_t* s_dash_claude_cost      = nullptr;   // "$3.50"
+static lv_obj_t* s_dash_codex_big        = nullptr;
+static lv_obj_t* s_dash_codex_5h_bar     = nullptr;
+static lv_obj_t* s_dash_codex_5h_rst     = nullptr;
+static lv_obj_t* s_dash_codex_7d_bar     = nullptr;
+static lv_obj_t* s_dash_codex_7d_rst     = nullptr;
+static lv_obj_t* s_dash_clock            = nullptr;
 
 // Claude pet (OpenPets "claude" default — orange octopus) — mirror of the
 // codex pet machinery. row 0 = idle (slow blinks), row 7 = running (working).
@@ -262,6 +304,22 @@ static lv_obj_t* mk_hbar(lv_obj_t* parent, int x, int y, int w, int h,
     lv_obj_set_style_bg_color(b, lv_color_hex(fill_color), LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_INDICATOR);
     return b;
+}
+
+// Centered text within an arc's bounding box (x..x+92). Use this instead of
+// hand-positioned mk_text so the label/value/subtitle line up with the arc
+// regardless of how wide the text turns out to be.
+static lv_obj_t* mk_arc_text(lv_obj_t* parent, int arc_x, int y,
+                             const lv_font_t* font, uint32_t color,
+                             const char* initial) {
+    lv_obj_t* l = lv_label_create(parent);
+    lv_label_set_text(l, initial);
+    lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_width(l, 92);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(l, arc_x, y);
+    return l;
 }
 
 static lv_obj_t* mk_arc(lv_obj_t* parent, int x, int y, int size,
@@ -366,27 +424,136 @@ static void draw_codex_pet(lv_obj_t* parent, int cx, int cy) {
     }
 }
 
-// Pink ghost mascot — approximation of the mockup using LVGL primitives.
-// Body: rounded square in pink (#FF7AB6). Eyes: two black dots.
-// Headphone arc: red rectangle on top + small caps at sides.
+// Quota row: 4 widgets aligned to user's importance hierarchy.
+//   left:   big label "5H" / "7D"   (18px, white)        — title
+//   middle: bar (10px tall)         — visualization
+//   right:  big "67%"                (24px, brand color)  — primary number
+//   below bar, right-aligned: small "23:00" reset (14px gray) — supporting
+struct QuotaRow {
+    lv_obj_t* label;
+    lv_obj_t* bar;
+    lv_obj_t* pct;
+    lv_obj_t* reset;
+};
+static QuotaRow mk_quota_row(lv_obj_t* parent, int y, uint32_t color,
+                             const char* init_label) {
+    QuotaRow r{};
+    // Block is centered on the 466px display: label at x=54, pct right-edge at x=412.
+    // Bar stretches all the way up to pct's left edge so "100%" sits right next to it.
+    // Short values like "7%" still leave a gap by nature of right-aligning a short string,
+    // but the bar itself now fills the row so the eye reads it as one connected block.
+    constexpr int LABEL_X = 54;
+    constexpr int BAR_X   = 102;
+    constexpr int BAR_W   = 244;                  // bar ends at 346
+    constexpr int PCT_X   = BAR_X + BAR_W;        // = 346 — pct box starts right at bar end
+    constexpr int PCT_W   = 66;                    // right edge at 412; symmetric to LABEL_X=54
+
+    // Big label on the left, vertically centered with the bar+pct row.
+    r.label = lv_label_create(parent);
+    lv_label_set_text(r.label, init_label);
+    lv_obj_set_style_text_color(r.label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(r.label, &lv_font_montserrat_18, 0);
+    lv_obj_set_pos(r.label, LABEL_X, y - 2);
+
+    // Bar in the middle.
+    r.bar = lv_bar_create(parent);
+    lv_obj_set_size(r.bar, BAR_W, 10);
+    lv_obj_set_pos(r.bar, BAR_X, y + 8);
+    lv_bar_set_range(r.bar, 0, 100);
+    lv_obj_set_style_radius(r.bar, 5, 0);
+    lv_obj_set_style_radius(r.bar, 5, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(r.bar, lv_color_hex(0x303042), 0);
+    lv_obj_set_style_bg_opa(r.bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(r.bar, lv_color_hex(color), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(r.bar, LV_OPA_COVER, LV_PART_INDICATOR);
+
+    // Big % on the right — fixed-width box right-aligned so "7%" and "100%" both end at the same edge.
+    r.pct = lv_label_create(parent);
+    lv_label_set_text(r.pct, "--%");
+    lv_obj_set_style_text_color(r.pct, lv_color_hex(color), 0);
+    lv_obj_set_style_text_font(r.pct, &lv_font_montserrat_24, 0);
+    lv_obj_set_width(r.pct, PCT_W);
+    lv_obj_set_style_text_align(r.pct, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(r.pct, PCT_X, y - 6);
+
+    // Reset time floats just ABOVE the bar, right-aligned to the bar's right edge.
+    // Same visual block as the bar — not its own row.
+    r.reset = lv_label_create(parent);
+    lv_label_set_text(r.reset, "");
+    lv_obj_set_style_text_color(r.reset, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(r.reset, &lv_font_montserrat_14, 0);
+    lv_obj_set_width(r.reset, BAR_W);
+    lv_obj_set_style_text_align(r.reset, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(r.reset, BAR_X, y - 8);
+    return r;
+}
+
+// Stat row: same alignment as the quota row (LABEL_X=54 left, value right-edge at 412)
+// but no bar/reset — for unbounded counters like today's cost or token total.
+// A thin gray "leader" line bridges label and value so the eye reads the row as
+// one connected element instead of two floating words on opposite edges.
+struct StatRow {
+    lv_obj_t* label;
+    lv_obj_t* leader;
+    lv_obj_t* value;
+};
+static StatRow mk_stat_row(lv_obj_t* parent, int y, uint32_t color,
+                           const char* init_label) {
+    constexpr int LABEL_X  = 54;
+    constexpr int VALUE_W  = 100;                  // wide enough for "$999.99"
+    constexpr int VALUE_X  = 412 - VALUE_W;        // = 312, right edge symmetric with quota row
+    constexpr int LEADER_X = 130;                  // after the "TODAY"/"TOKENS" label
+    constexpr int LEADER_W = 175;                  // ends at 305 — 7px gap before value box
+
+    StatRow r{};
+    r.label = lv_label_create(parent);
+    lv_label_set_text(r.label, init_label);
+    lv_obj_set_style_text_color(r.label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(r.label, &lv_font_montserrat_18, 0);
+    lv_obj_set_pos(r.label, LABEL_X, y - 2);
+
+    r.leader = lv_obj_create(parent);
+    lv_obj_remove_flag(r.leader, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(r.leader, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(r.leader, LEADER_W, 2);
+    lv_obj_set_style_radius(r.leader, 1, 0);
+    lv_obj_set_style_bg_color(r.leader, lv_color_hex(0x303042), 0);
+    lv_obj_set_style_bg_opa(r.leader, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(r.leader, 0, 0);
+    lv_obj_set_style_pad_all(r.leader, 0, 0);
+    lv_obj_set_pos(r.leader, LEADER_X, y + 12);    // sits at vertical mid of the value text
+
+    r.value = lv_label_create(parent);
+    lv_label_set_text(r.value, "--");
+    lv_obj_set_style_text_color(r.value, lv_color_hex(color), 0);
+    lv_obj_set_style_text_font(r.value, &lv_font_montserrat_24, 0);
+    lv_obj_set_width(r.value, VALUE_W);
+    lv_obj_set_style_text_align(r.value, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(r.value, VALUE_X, y - 6);
+    return r;
+}
+
 static void build_claude_screen(void) {
     lv_obj_t* scr = lv_obj_create(NULL);
     s_scr_claude = scr;
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Title + underline. Claude family color is orange (matches Anthropic
-    // branding); Codex page uses cyan for visual contrast on swipe.
-    mk_center_text(scr, "Claude Code", 30, &lv_font_montserrat_24, 0xFF6B35);
-    lv_obj_t* line = lv_obj_create(scr);
-    lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(line, 126, 4);
-    lv_obj_set_style_radius(line, 2, 0);
-    lv_obj_set_style_bg_color(line, lv_color_hex(0xFF6B35), 0);
-    lv_obj_set_style_border_width(line, 0, 0);
-    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 62);
+    // Title row: 32px logo + 24px "Claude" text.
+    // Logo widget bounding box is the original 48px even though displayed is scaled to ~32;
+    // visible image sits centered inside (8px padding T/B/L/R).
+    // Vertical centering: image center = widget_y + 24. Montserrat_24 cap center ≈ title_y + 14.
+    // So widget_y = title_y - 10 puts both centers on the same line.
+    lv_obj_t* logo = lv_image_create(scr);
+    lv_image_set_src(logo, &logo_claude);
+    lv_image_set_scale(logo, 170);   // 48 * 170/256 ≈ 32
+    lv_obj_set_pos(logo, 162, 22);   // visible logo: x 170–202, y 30–62
+    lv_obj_t* title = lv_label_create(scr);
+    lv_label_set_text(title, "Claude");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFF6B35), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_pos(title, 212, 32);
 
-    // Recording indicator — shared visual language with Codex page.
     s_rec_dot = lv_obj_create(scr);
     lv_obj_remove_flag(s_rec_dot, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(s_rec_dot, LV_OBJ_FLAG_CLICKABLE);
@@ -394,65 +561,40 @@ static void build_claude_screen(void) {
     lv_obj_set_style_radius(s_rec_dot, 6, 0);
     lv_obj_set_style_bg_color(s_rec_dot, lv_color_hex(0xFF2F2F), 0);
     lv_obj_set_style_border_width(s_rec_dot, 0, 0);
-    lv_obj_align(s_rec_dot, LV_ALIGN_TOP_MID, 0, 79);
+    lv_obj_align(s_rec_dot, LV_ALIGN_TOP_MID, 0, 72);
     lv_obj_add_flag(s_rec_dot, LV_OBJ_FLAG_HIDDEN);
 
-    // Left arc: MODEL (orange family color)
-    mk_arc(scr, 70, 118, 92, 0xFF6B35, 62, 195);
-    mk_text(scr, "MODEL", 91, 150, &lv_font_montserrat_14, 0xF2EAF9);
-    s_model_value = mk_text(scr, "-", 79, 169, &lv_font_montserrat_18, 0xFFFFFF);
-    fit_label(s_model_value, 86);
-    mk_text(scr, "claude", 95, 194, &lv_font_montserrat_14, 0xD8D0F0);
+    // Left arc: MODEL. Decorative fixed fill — API-key users have no quota to sync to.
+    s_claude_model_arc = mk_arc(scr, 70, 105, 92, 0xFF6B35, 65, 195);
+    mk_arc_text(scr, 70, 138, &lv_font_montserrat_14, 0xF2EAF9, "MODEL");
+    s_model_value = mk_arc_text(scr, 70, 157, &lv_font_montserrat_18, 0xFFFFFF, "-");
+    mk_arc_text(scr, 70, 182, &lv_font_montserrat_14, 0xD8D0F0, "claude");
 
-    // Center mascot — orange octopus (openpets default "claude" pet)
-    draw_claude_pet(scr, 234, 160);
+    draw_claude_pet(scr, 234, 147);
 
-    // Right arc: MODE (cyan family color)
-    mk_arc(scr, 306, 118, 92, 0x88CCEE, 50, 230);
-    mk_text(scr, "MODE", 332, 150, &lv_font_montserrat_14, 0xF2EAF9);
-    s_mode_value = mk_text(scr, "IDLE", 333, 171, &lv_font_montserrat_18, 0x88CCEE);
-    mk_text(scr, "session", 320, 197, &lv_font_montserrat_14, 0xD8D0F0);
+    // Right arc: STATUS. Dynamic — set to 100 when busy, 30 when idle, in ui_set_claude_metrics.
+    s_claude_mode_arc = mk_arc(scr, 306, 105, 92, 0x88CCEE, 30, 230);
+    mk_arc_text(scr, 306, 138, &lv_font_montserrat_14, 0xF2EAF9, "STATUS");
+    s_mode_value = mk_arc_text(scr, 306, 157, &lv_font_montserrat_18, 0x88CCEE, "IDLE");
+    mk_arc_text(scr, 306, 182, &lv_font_montserrat_14, 0xD8D0F0, "session");
 
-    // Live Metrics header + line
-    mk_text(scr, "Live Metrics", 70, 244, &lv_font_montserrat_14, 0xFF6B35);
-    lv_obj_t* metric_line = lv_obj_create(scr);
-    lv_obj_remove_flag(metric_line, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(metric_line, 112, 2);
-    lv_obj_set_style_bg_color(metric_line, lv_color_hex(0x38354A), 0);
-    lv_obj_set_style_border_width(metric_line, 0, 0);
-    lv_obj_set_pos(metric_line, 245, 252);
+    // No quota for API-key users → show today's cost and tokens instead.
+    // Same row alignment as Codex quota for visual consistency.
+    StatRow today  = mk_stat_row(scr, 220, 0xFF6B35, "TODAY");
+    s_claude_today_label  = today.label;
+    s_claude_today_leader = today.leader;
+    s_claude_today_value  = today.value;
+    StatRow tokens = mk_stat_row(scr, 268, 0xFF6B35, "TOKENS");
+    s_claude_tokens_label  = tokens.label;
+    s_claude_tokens_leader = tokens.leader;
+    s_claude_tokens_value  = tokens.value;
 
-    // OUT row: tokens out / bar (scale: 100k = 100%)
-    mk_text(scr, "OUT", 77, 272, &lv_font_montserrat_14, 0xF2EAF9);
-    s_out_value = mk_text(scr, "0", 132, 271, &lv_font_montserrat_14, 0xFFFFFF);
-    fit_label(s_out_value, 86);
-    s_out_bar = mk_hbar(scr, 236, 272, 124, 14, 0xFF6B35);
-    s_out_pct_label = mk_text(scr, "0%", 370, 268, &lv_font_montserrat_14, 0xFF6B42);
+    // Inline TodoList header — text becomes "TodoList X / Y" (or hidden if 0 todos).
+    s_todos_label = mk_center_text(scr, "TodoList", 300, &lv_font_montserrat_18, 0xF3EEF8);
+    lv_obj_align(s_todos_label, LV_ALIGN_TOP_MID, 0, 300);
 
-    // COST row: $X.XX / bar (scale: $10 = 100%)
-    mk_text(scr, "COST", 77, 304, &lv_font_montserrat_14, 0xF2EAF9);
-    s_cost_value = mk_text(scr, "$0.00", 132, 303, &lv_font_montserrat_14, 0xFFFFFF);
-    fit_label(s_cost_value, 86);
-    s_cost_bar = mk_hbar(scr, 236, 304, 124, 14, 0x88CCEE);
-    s_cost_pct_label = mk_text(scr, "0%", 370, 300, &lv_font_montserrat_14, 0x88CCEE);
-
-    // TodoList header + line
-    mk_text(scr, "TodoList", 100, 334, &lv_font_montserrat_18, 0xF3EEF8);
-    lv_obj_t* todo_line = lv_obj_create(scr);
-    lv_obj_remove_flag(todo_line, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(todo_line, 155, 2);
-    lv_obj_set_style_bg_color(todo_line, lv_color_hex(0x48475C), 0);
-    lv_obj_set_style_border_width(todo_line, 0, 0);
-    lv_obj_set_pos(todo_line, 216, 344);
-
-    // Centered "X / Y" + per-todo dot matrix below.
-    s_todos_label = mk_center_text(scr, "- / -", 360, &lv_font_montserrat_18, 0xFFFFFF);
-    lv_obj_align(s_todos_label, LV_ALIGN_TOP_MID, 0, 360);
-
-    // Pre-allocate the dot widgets — show/hide/recolor based on status string.
-    // Each dot is 10px diameter (stride managed in ui_set_todos_statuses).
     constexpr int DOT_D = 10;
-    constexpr int DOTS_ROW_Y = 392;
+    constexpr int DOTS_ROW_Y = 328;
     for (int i = 0; i < TODO_DOTS_MAX; ++i) {
         lv_obj_t* dot = lv_obj_create(scr);
         lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
@@ -463,17 +605,19 @@ static void build_claude_screen(void) {
         lv_obj_set_style_border_width(dot, 0, 0);
         lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
         s_todo_dots[i] = dot;
-        // Positioned on demand in ui_set_todos_statuses (centering depends on count).
         lv_obj_set_pos(dot, 0, DOTS_ROW_Y);
     }
 
-    // Transcript at the very bottom — fills as ASR runs (Montserrat, ASCII).
-    s_transcript_label = mk_center_text(scr, "", 418, &lv_font_montserrat_14, 0xFFD700);
+    // Bottom summary line: today cost + tokens + Mac local time.
+    s_claude_summary = mk_center_text(scr, "Today $-- -- Tokens --:--",
+                                       378, &lv_font_montserrat_14, 0xCCCCCC);
+    lv_obj_align(s_claude_summary, LV_ALIGN_TOP_MID, 0, 378);
+
+    s_transcript_label = mk_center_text(scr, "", 404, &lv_font_montserrat_14, 0xFFD700);
     lv_obj_set_width(s_transcript_label, 380);
     lv_label_set_long_mode(s_transcript_label, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_transcript_label, LV_ALIGN_TOP_MID, 0, 418);
+    lv_obj_align(s_transcript_label, LV_ALIGN_TOP_MID, 0, 404);
 
-    // Battery indicator at the very bottom.
     s_battery_claude = lv_label_create(scr);
     lv_label_set_text(s_battery_claude, LV_SYMBOL_BATTERY_EMPTY " --%");
     lv_obj_set_style_text_color(s_battery_claude, lv_color_hex(0x888888), 0);
@@ -487,14 +631,16 @@ static void build_codex_screen(void) {
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    mk_center_text(scr, "CodeX", 30, &lv_font_montserrat_24, 0x25C7FF);
-    lv_obj_t* line = lv_obj_create(scr);
-    lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(line, 126, 4);
-    lv_obj_set_style_radius(line, 2, 0);
-    lv_obj_set_style_bg_color(line, lv_color_hex(0x25C7FF), 0);
-    lv_obj_set_style_border_width(line, 0, 0);
-    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 62);
+    // Title row — same vertical centering logic as Claude (see comment there).
+    lv_obj_t* logo = lv_image_create(scr);
+    lv_image_set_src(logo, &logo_codex);
+    lv_image_set_scale(logo, 170);
+    lv_obj_set_pos(logo, 168, 22);   // visible logo: x 176–208, y 30–62
+    lv_obj_t* title = lv_label_create(scr);
+    lv_label_set_text(title, "Codex");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x25C7FF), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_pos(title, 218, 32);
 
     s_codex_rec_dot = lv_obj_create(scr);
     lv_obj_remove_flag(s_codex_rec_dot, LV_OBJ_FLAG_SCROLLABLE);
@@ -503,62 +649,46 @@ static void build_codex_screen(void) {
     lv_obj_set_style_radius(s_codex_rec_dot, 6, 0);
     lv_obj_set_style_bg_color(s_codex_rec_dot, lv_color_hex(0xFF2F2F), 0);
     lv_obj_set_style_border_width(s_codex_rec_dot, 0, 0);
-    lv_obj_align(s_codex_rec_dot, LV_ALIGN_TOP_MID, 0, 79);
+    lv_obj_align(s_codex_rec_dot, LV_ALIGN_TOP_MID, 0, 72);
     lv_obj_add_flag(s_codex_rec_dot, LV_OBJ_FLAG_HIDDEN);
 
-    mk_arc(scr, 70, 118, 92, 0xFF4A2D, 62, 195);
-    mk_text(scr, "MODEL", 91, 150, &lv_font_montserrat_14, 0xF2EAF9);
-    s_codex_model_value = mk_text(scr, "GPT-5.5", 79, 169, &lv_font_montserrat_18, 0xFFFFFF);
-    mk_text(scr, "auto", 101, 194, &lv_font_montserrat_14, 0xD8D0F0);
+    // Codex MODEL arc fills with 5h remaining %.
+    s_codex_model_arc = mk_arc(scr, 70, 105, 92, 0xFF4A2D, 0, 195);
+    mk_arc_text(scr, 70, 138, &lv_font_montserrat_14, 0xF2EAF9, "MODEL");
+    s_codex_model_value = mk_arc_text(scr, 70, 157, &lv_font_montserrat_18, 0xFFFFFF, "GPT-5.5");
+    mk_arc_text(scr, 70, 182, &lv_font_montserrat_14, 0xD8D0F0, "auto");
 
-    draw_codex_pet(scr, 234, 160);
+    draw_codex_pet(scr, 234, 147);
 
-    mk_arc(scr, 306, 118, 92, 0x25C7FF, 76, 230);
-    mk_text(scr, "EFFORT", 329, 150, &lv_font_montserrat_14, 0xF2EAF9);
-    s_codex_effort_value = mk_text(scr, "--", 333, 171, &lv_font_montserrat_18, 0x25C7FF);
-    mk_text(scr, "reasoning", 318, 197, &lv_font_montserrat_14, 0xD8D0F0);
+    // EFFORT arc: fill = 7d remaining % (synced); text shows reasoning level.
+    s_codex_effort_arc = mk_arc(scr, 306, 105, 92, 0x25C7FF, 0, 230);
+    mk_arc_text(scr, 306, 138, &lv_font_montserrat_14, 0xF2EAF9, "EFFORT");
+    s_codex_effort_value = mk_arc_text(scr, 306, 157, &lv_font_montserrat_18, 0x25C7FF, "--");
+    mk_arc_text(scr, 306, 182, &lv_font_montserrat_14, 0xD8D0F0, "reasoning");
 
-    mk_text(scr, "Live Metrics", 70, 244, &lv_font_montserrat_14, 0xFF4A2D);
-    lv_obj_t* metric_line = lv_obj_create(scr);
-    lv_obj_remove_flag(metric_line, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(metric_line, 112, 2);
-    lv_obj_set_style_bg_color(metric_line, lv_color_hex(0x38354A), 0);
-    lv_obj_set_style_border_width(metric_line, 0, 0);
-    lv_obj_set_pos(metric_line, 245, 252);
+    // Quota rows — both bars cyan; y=220 / y=268 (48px apart).
+    QuotaRow q5 = mk_quota_row(scr, 220, 0x25C7FF, "5H");
+    s_codex_5h_label = q5.label;
+    s_codex_5h_pct   = q5.pct;
+    s_codex_5h_reset = q5.reset;
+    s_codex_5h_bar   = q5.bar;
+    QuotaRow qw = mk_quota_row(scr, 268, 0x25C7FF, "7D");
+    s_codex_7d_label = qw.label;
+    s_codex_7d_pct   = qw.pct;
+    s_codex_7d_reset = qw.reset;
+    s_codex_7d_bar   = qw.bar;
 
-    mk_text(scr, "5H", 77, 272, &lv_font_montserrat_14, 0xF2EAF9);
-    s_codex_5h_value = mk_text(scr, "--% used", 132, 271, &lv_font_montserrat_14, 0xFFFFFF);
-    fit_label(s_codex_5h_value, 86);
-    s_codex_5h_bar = mk_hbar(scr, 236, 272, 124, 14, 0xFF4A2D);
-    s_codex_5h_pct_label = mk_text(scr, "--%", 370, 268, &lv_font_montserrat_14, 0xFF6B42);
-
-    mk_text(scr, "WEEK", 77, 304, &lv_font_montserrat_14, 0xF2EAF9);
-    s_codex_week_value = mk_text(scr, "--% used", 132, 303, &lv_font_montserrat_14, 0xFFFFFF);
-    fit_label(s_codex_week_value, 86);
-    s_codex_week_bar = mk_hbar(scr, 236, 304, 124, 14, 0x21BFFF);
-    s_codex_week_pct_label = mk_text(scr, "--%", 370, 300, &lv_font_montserrat_14, 0x21BFFF);
-
-    // Activity section (Codex.app focus time, derived from frontmost-app
-    // polling on the Mac). Two rows: TODAY and WEEK.
-    mk_text(scr, "Activity", 100, 334, &lv_font_montserrat_18, 0xF3EEF8);
-    lv_obj_t* act_line = lv_obj_create(scr);
-    lv_obj_remove_flag(act_line, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(act_line, 155, 2);
-    lv_obj_set_style_bg_color(act_line, lv_color_hex(0x48475C), 0);
-    lv_obj_set_style_border_width(act_line, 0, 0);
-    lv_obj_set_pos(act_line, 216, 344);
-
-    mk_text(scr, "DAY", 77, 360, &lv_font_montserrat_14, 0xF2EAF9);
-    s_codex_today_value = mk_text(scr, "-- min", 132, 359, &lv_font_montserrat_14, 0xFFFFFF);
-    fit_label(s_codex_today_value, 86);
-    s_codex_today_bar = mk_hbar(scr, 236, 360, 124, 12, 0xFF4A2D);
-    s_codex_today_pct = mk_text(scr, "--%", 370, 356, &lv_font_montserrat_14, 0xFF6B42);
-
-    mk_text(scr, "WK", 77, 388, &lv_font_montserrat_14, 0xF2EAF9);
-    s_codex_actweek_value = mk_text(scr, "-- min", 132, 387, &lv_font_montserrat_14, 0xFFFFFF);
-    fit_label(s_codex_actweek_value, 86);
-    s_codex_actweek_bar = mk_hbar(scr, 236, 388, 124, 12, 0x21BFFF);
-    s_codex_actweek_pct = mk_text(scr, "--%", 370, 384, &lv_font_montserrat_14, 0x21BFFF);
+    // Bottom block spread out — Codex has no TodoList/dots/summary, so we have ~140px
+    // of room from bar bottom (~290) to battery (~440). Use it.
+    mk_center_text(scr, "Activity", 320, &lv_font_montserrat_18, 0xF3EEF8);
+    s_codex_today_value   = mk_center_text(scr, "DAY  -- m", 358,
+                                            &lv_font_montserrat_14, 0xCCCCCC);
+    s_codex_actweek_value = mk_center_text(scr, "WK  -- m", 388,
+                                            &lv_font_montserrat_14, 0xCCCCCC);
+    s_codex_today_bar     = nullptr;
+    s_codex_today_pct     = nullptr;
+    s_codex_actweek_bar   = nullptr;
+    s_codex_actweek_pct   = nullptr;
 
     // Battery indicator at the very bottom.
     s_battery_codex = lv_label_create(scr);
@@ -566,6 +696,280 @@ static void build_codex_screen(void) {
     lv_obj_set_style_text_color(s_battery_codex, lv_color_hex(0x888888), 0);
     lv_obj_set_style_text_font(s_battery_codex, &lv_font_montserrat_14, 0);
     lv_obj_align(s_battery_codex, LV_ALIGN_BOTTOM_MID, 0, -8);
+}
+
+// Compact bar row used inside the dashboard halves: label top-left, reset top-right,
+// thin 4px bar below. Width is caller-controlled so it fits inside the circle.
+struct DashBarRow {
+    lv_obj_t* label;
+    lv_obj_t* reset;
+    lv_obj_t* bar;
+};
+static DashBarRow mk_dash_bar_row(lv_obj_t* parent, int x, int y, int width,
+                                  uint32_t fill, const char* label_text) {
+    DashBarRow r{};
+    r.label = lv_label_create(parent);
+    lv_label_set_text(r.label, label_text);
+    lv_obj_set_style_text_color(r.label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_font(r.label, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(r.label, x, y);
+
+    r.reset = lv_label_create(parent);
+    lv_label_set_text(r.reset, "reset --");
+    lv_obj_set_style_text_color(r.reset, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(r.reset, &lv_font_montserrat_14, 0);
+    lv_obj_set_width(r.reset, width);
+    lv_obj_set_style_text_align(r.reset, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(r.reset, x, y);
+
+    r.bar = lv_bar_create(parent);
+    lv_obj_set_size(r.bar, width, 6);
+    lv_obj_set_pos(r.bar, x, y + 22);
+    lv_bar_set_range(r.bar, 0, 100);
+    lv_obj_set_style_radius(r.bar, 3, 0);
+    lv_obj_set_style_radius(r.bar, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(r.bar, lv_color_hex(0x2A2A3A), 0);
+    lv_obj_set_style_bg_opa(r.bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(r.bar, lv_color_hex(fill), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(r.bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    return r;
+}
+
+// Left-column block: brand (small logo + name) on top, big "67%" middle, "REMAINING" bottom.
+// All three are vertically stacked and horizontally centered around x=130 so they
+// read as one unit instead of three floating pieces.
+//   title_y_abs = absolute y of the brand title baseline anchor.
+//   pct_y_abs   = absolute y of the big-% label top.
+//   sub_y_abs   = absolute y of the REMAINING label top.
+//   text_w      = approx pixel width of "Claude"/"Codex" wordmark, for centering the brand row.
+//   returns the big-% label so callers can update it later.
+static constexpr int LEFT_CENTER_X = 130;
+
+static lv_obj_t* mk_dash_left_block(lv_obj_t* parent,
+                                    const lv_image_dsc_t* logo,
+                                    const char* name, uint32_t color,
+                                    int text_w,
+                                    int title_y_abs, int pct_y_abs, int sub_y_abs) {
+    // Brand row centered at x=LEFT_CENTER_X. Logo widget bbox is 48 but image is
+    // scaled to ~22 around the widget center (default pivot), so visible image
+    // spans widget_x+13 … widget_x+35. We work backward from that to lay out the row.
+    constexpr int LOGO_VIS = 22;
+    constexpr int GAP      = 6;
+    int block_w  = LOGO_VIS + GAP + text_w;
+    int block_x  = LEFT_CENTER_X - block_w / 2;       // visible left edge of brand row
+    int logo_widget_x = block_x - 13;
+    int title_x       = block_x + LOGO_VIS + GAP;
+    int logo_widget_y = title_y_abs - 14;             // image-center y matches text cap-center y
+
+    lv_obj_t* img = lv_image_create(parent);
+    lv_image_set_src(img, logo);
+    lv_image_set_scale(img, 117);                     // 48 * 117/256 ≈ 22
+    lv_obj_set_pos(img, logo_widget_x, logo_widget_y);
+
+    lv_obj_t* t = lv_label_create(parent);
+    lv_label_set_text(t, name);
+    lv_obj_set_style_text_color(t, lv_color_hex(color), 0);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_18, 0);
+    lv_obj_set_pos(t, title_x, title_y_abs);
+
+    lv_obj_t* big = lv_label_create(parent);
+    lv_label_set_text(big, "--%");
+    lv_obj_set_style_text_color(big, lv_color_hex(color), 0);
+    lv_obj_set_style_text_font(big, &lv_font_montserrat_48, 0);
+    lv_obj_set_width(big, 160);
+    lv_obj_set_style_text_align(big, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(big, LEFT_CENTER_X - 80, pct_y_abs);
+
+    lv_obj_t* sub = lv_label_create(parent);
+    lv_label_set_text(sub, "REMAINING");
+    lv_obj_set_style_text_color(sub, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_letter_space(sub, 2, 0);
+    lv_obj_set_width(sub, 160);
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(sub, LEFT_CENTER_X - 80, sub_y_abs);
+    return big;
+}
+
+// ================== Pet screen ==================
+// Single fullscreen image, cycles through idle/wait/fail/review at random when
+// not recording; switches to "wave" while the user holds the record button.
+
+enum KittyState { K_IDLE = 0, K_WAVE, K_FAIL, K_WAIT, K_REVIEW };
+
+static lv_obj_t* s_kitty_img             = nullptr;
+static lv_timer_t* s_kitty_timer         = nullptr;
+static KittyState s_kitty_state          = K_IDLE;
+static uint8_t s_kitty_frame             = 0;
+// "Most of the time idle, with the occasional expression mixed in."
+// We sit in K_IDLE for N cycles, then play ONE cycle of a random expression
+// (wait/fail/review), then return to K_IDLE.
+static uint8_t s_kitty_idle_cycles_left  = 0;
+static bool s_kitty_recording            = false;
+
+static const lv_image_dsc_t* const* kitty_anim_frames(KittyState s) {
+    switch (s) {
+        case K_WAVE:   return kitty_pet_wave_frames;
+        case K_FAIL:   return kitty_pet_fail_frames;
+        case K_WAIT:   return kitty_pet_wait_frames;
+        case K_REVIEW: return kitty_pet_review_frames;
+        case K_IDLE:
+        default:       return kitty_pet_idle_frames;
+    }
+}
+static const uint32_t* kitty_anim_durs(KittyState s) {
+    switch (s) {
+        case K_WAVE:   return kitty_pet_wave_durations_ms;
+        case K_FAIL:   return kitty_pet_fail_durations_ms;
+        case K_WAIT:   return kitty_pet_wait_durations_ms;
+        case K_REVIEW: return kitty_pet_review_durations_ms;
+        case K_IDLE:
+        default:       return kitty_pet_idle_durations_ms;
+    }
+}
+static int kitty_anim_count(KittyState s) {
+    // Frame counts differ per row in petdex sprites (the original wave row has
+    // only 4 non-empty frames; treating all rows as 6 caused blank-frame flashes).
+    switch (s) {
+        case K_WAVE:   return KITTY_PET_WAVE_FRAME_COUNT;
+        case K_FAIL:   return KITTY_PET_FAIL_FRAME_COUNT;
+        case K_WAIT:   return KITTY_PET_WAIT_FRAME_COUNT;
+        case K_REVIEW: return KITTY_PET_REVIEW_FRAME_COUNT;
+        case K_IDLE:
+        default:       return KITTY_PET_IDLE_FRAME_COUNT;
+    }
+}
+
+static KittyState kitty_random_expression(void) {
+    // Expressions sprinkled in between long idle stretches.
+    static const KittyState pool[] = { K_WAIT, K_FAIL, K_REVIEW };
+    return pool[esp_random() % 3];
+}
+
+// Number of idle cycles to play before slipping in one expression.
+// Idle is ~6 frames × ~280ms ≈ 1.7s, so 4–8 cycles ≈ 7–14s of "just idle".
+static uint8_t kitty_pick_idle_run(void) { return 4 + (esp_random() % 5); }
+
+static void kitty_timer_cb(lv_timer_t* /*t*/) {
+    if (!s_kitty_img) return;
+    s_kitty_frame++;
+    if (s_kitty_frame >= kitty_anim_count(s_kitty_state)) {
+        s_kitty_frame = 0;
+        if (s_kitty_recording) {
+            s_kitty_state = K_WAVE;
+        } else if (s_kitty_state == K_IDLE) {
+            if (s_kitty_idle_cycles_left > 1) {
+                s_kitty_idle_cycles_left--;     // stay calm — replay idle
+            } else {
+                s_kitty_idle_cycles_left = 0;
+                s_kitty_state = kitty_random_expression();   // pop one expression
+            }
+        } else {
+            // The expression cycle just finished — fall back to idle, then sit there a while.
+            s_kitty_state = K_IDLE;
+            s_kitty_idle_cycles_left = kitty_pick_idle_run();
+        }
+    }
+    lv_image_set_src(s_kitty_img, kitty_anim_frames(s_kitty_state)[s_kitty_frame]);
+    lv_timer_set_period(s_kitty_timer, kitty_anim_durs(s_kitty_state)[s_kitty_frame]);
+}
+
+static void kitty_set_recording_locked(bool recording) {
+    s_kitty_recording = recording;
+    if (recording) {
+        // Snap to wave immediately so the user gets feedback on touch-down.
+        s_kitty_state = K_WAVE;
+        s_kitty_frame = 0;
+        if (s_kitty_img) lv_image_set_src(s_kitty_img, kitty_pet_wave_frames[0]);
+        if (s_kitty_timer) lv_timer_set_period(s_kitty_timer,
+                                               kitty_pet_wave_durations_ms[0]);
+    } else {
+        // After release, the running wave cycle finishes and the timer_cb's
+        // "expression done → return to idle" branch takes over naturally.
+        s_kitty_idle_cycles_left = kitty_pick_idle_run();
+    }
+}
+
+static void build_pet_screen(void) {
+    lv_obj_t* scr = lv_obj_create(NULL);
+    s_scr_pet = scr;
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_kitty_img = lv_image_create(scr);
+    lv_image_set_src(s_kitty_img, kitty_pet_idle_frames[0]);
+    // Source 96×104, display at scale 2× → 192×208 visible (≈41% × 45% of the round
+    // display). Cuts the per-frame render cost ~36% vs 2.5× so playback stays smooth.
+    lv_image_set_scale(s_kitty_img, 512);
+    lv_image_set_antialias(s_kitty_img, false);
+    lv_obj_set_pos(s_kitty_img,
+                   (468 - KITTY_PET_FRAME_W) / 2,
+                   (466 - KITTY_PET_FRAME_H) / 2);
+    lv_obj_clear_flag(s_kitty_img, LV_OBJ_FLAG_CLICKABLE);
+
+    s_kitty_state = K_IDLE;
+    s_kitty_idle_cycles_left = kitty_pick_idle_run();
+
+    if (!s_kitty_timer) {
+        s_kitty_timer = lv_timer_create(kitty_timer_cb,
+                                        kitty_pet_idle_durations_ms[0], nullptr);
+    }
+}
+
+static void build_dashboard_screen(void) {
+    lv_obj_t* scr = lv_obj_create(NULL);
+    s_scr_dashboard = scr;
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Right column kept narrow so "reset 6/11 10:39" never grazes the bezel.
+    // At y≈110 the circle visible x runs from ~35 to ~430; right edge 390 leaves 40px margin.
+    constexpr int COMPACT_X = 250;
+    constexpr int COMPACT_W = 140;
+
+    // ========== TOP HALF: CLAUDE ==========
+    // Top content slid down a touch, bottom slid up — gap between halves shrinks
+    // from ~67px to ~40px so the two read more like one dashboard, less like two cards.
+    s_dash_claude_big = mk_dash_left_block(scr, &logo_claude, "Claude", 0xFF6B35,
+                                            68, 80, 114, 176);
+
+    DashBarRow tok = mk_dash_bar_row(scr, COMPACT_X, 114, COMPACT_W, 0xFF6B35, "Token");
+    s_dash_claude_token_bar = tok.bar;
+    s_dash_claude_token_rst = tok.reset;
+    lv_label_set_text(tok.reset, "reset 00:00");
+
+    lv_obj_t* row2_lbl = lv_label_create(scr);
+    lv_label_set_text(row2_lbl, "Today");
+    lv_obj_set_style_text_color(row2_lbl, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(row2_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(row2_lbl, COMPACT_X, 164);
+
+    s_dash_claude_cost = lv_label_create(scr);
+    lv_label_set_text(s_dash_claude_cost, "$--");
+    lv_obj_set_style_text_color(s_dash_claude_cost, lv_color_hex(0xFF6B35), 0);
+    lv_obj_set_style_text_font(s_dash_claude_cost, &lv_font_montserrat_18, 0);
+    lv_obj_set_width(s_dash_claude_cost, COMPACT_W);
+    lv_obj_set_style_text_align(s_dash_claude_cost, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(s_dash_claude_cost, COMPACT_X, 160);
+
+    // ========== BOTTOM HALF: CODEX ==========
+    s_dash_codex_big = mk_dash_left_block(scr, &logo_codex, "Codex", 0x25C7FF,
+                                           60, 236, 270, 332);
+
+    DashBarRow d5 = mk_dash_bar_row(scr, COMPACT_X, 270, COMPACT_W, 0x25C7FF, "5h");
+    s_dash_codex_5h_bar = d5.bar;
+    s_dash_codex_5h_rst = d5.reset;
+
+    DashBarRow d7 = mk_dash_bar_row(scr, COMPACT_X, 320, COMPACT_W, 0x25C7FF, "7d");
+    s_dash_codex_7d_bar = d7.bar;
+    s_dash_codex_7d_rst = d7.reset;
+
+    // Bottom clock.
+    s_dash_clock = lv_label_create(scr);
+    lv_label_set_text(s_dash_clock, "--:--");
+    lv_obj_set_style_text_color(s_dash_clock, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(s_dash_clock, &lv_font_montserrat_18, 0);
+    lv_obj_align(s_dash_clock, LV_ALIGN_BOTTOM_MID, 0, -16);
 }
 
 static void build_setup_screen(void) {
@@ -615,7 +1019,10 @@ static void build_setup_screen(void) {
 static void build_boot_screen(void) {
     build_claude_screen();
     build_codex_screen();
+    build_dashboard_screen();
+    build_pet_screen();
     build_setup_screen();
+    s_last_main = s_scr_claude;
     lv_screen_load(s_scr_claude);
 }
 
@@ -644,6 +1051,7 @@ void ui_set_recording(bool on) {
         }
         set_codex_pet_recording(on);
         set_claude_pet_recording(on);
+        kitty_set_recording_locked(on);
         lvgl_unlock();
     }
 }
@@ -673,20 +1081,19 @@ bool ui_consume_touch_activity(void) {
 
 void ui_set_model(const char* model) {
     if (!s_model_value || !model || !model[0]) return;
-    if (!lvgl_lock()) return;
-    // Compact form for the arc display: strip the "claude-" prefix and
-    // squash the patch version, e.g. "claude-opus-4-7" → "opus-4.7".
-    char short_name[20];
+    // Compact: strip "claude-" prefix, replace last '-' with '.'.
+    char m[18];
     const char* src = model;
     if (strncmp(src, "claude-", 7) == 0) src += 7;
     size_t i = 0;
-    for (; i < sizeof(short_name) - 1 && src[i]; ++i) short_name[i] = src[i];
-    short_name[i] = 0;
-    // Replace last '-' with '.' to look like a version number.
-    char* last_dash = strrchr(short_name, '-');
+    for (; i < sizeof(m) - 1 && src[i]; ++i) m[i] = src[i];
+    m[i] = 0;
+    char* last_dash = strrchr(m, '-');
     if (last_dash) *last_dash = '.';
-    lv_label_set_text(s_model_value, short_name);
-    lvgl_unlock();
+    if (lvgl_lock()) {
+        lv_label_set_text(s_model_value, m);
+        lvgl_unlock();
+    }
 }
 
 void ui_set_codex_model(const char* model) {
@@ -719,102 +1126,157 @@ void ui_set_codex_effort(const char* effort) {
     lvgl_unlock();
 }
 
-// Bar scale factors. 100M tokens / $5000 = 100%.
-static constexpr int64_t CLAUDE_TOKENS_BAR_MAX = 100000000LL;
-static constexpr float   CLAUDE_COST_BAR_MAX   = 5000.0f;
-
 void ui_set_claude_metrics(int tokens_out, float cost_usd, bool busy) {
+    // tokens / cost live in the TODAY / TOKENS rows (driven by ui_set_claude_summary).
+    // Here we update the STATUS arc text + give the arc a subtle BUSY/IDLE fill.
+    (void)tokens_out;
+    (void)cost_usd;
     if (!lvgl_lock()) return;
-    char b[32];
+    if (s_mode_value)      lv_label_set_text(s_mode_value, busy ? "BUSY" : "IDLE");
+    if (s_claude_mode_arc) lv_arc_set_value(s_claude_mode_arc, busy ? 100 : 30);
+    lvgl_unlock();
+}
 
-    // OUT row
-    if (s_out_value) {
-        if (tokens_out >= 1000) snprintf(b, sizeof(b), "%.1fK", tokens_out / 1000.0);
-        else                    snprintf(b, sizeof(b), "%d", tokens_out);
-        lv_label_set_text(s_out_value, b);
+// Format the quota row in HTML-preview style:
+//   "5H" big label | bar fills with USED% | big "67%" right | "reset HH:MM" above bar
+static void update_quota_row_locked(lv_obj_t* label_w, lv_obj_t* pct_w,
+                                    lv_obj_t* reset_w, lv_obj_t* bar_w,
+                                    const char* label_prefix, int used_pct,
+                                    const char* reset_abs) {
+    char b[16];
+    if (label_w) lv_label_set_text(label_w, label_prefix);
+    if (pct_w) {
+        if (used_pct < 0) snprintf(b, sizeof(b), "--%%");
+        else              snprintf(b, sizeof(b), "%d%%", used_pct);
+        lv_label_set_text(pct_w, b);
     }
-    int out_pct = (int)((int64_t)tokens_out * 100 / CLAUDE_TOKENS_BAR_MAX);
-    if (out_pct > 100) out_pct = 100;
-    if (s_out_bar)       lv_bar_set_value(s_out_bar, out_pct, LV_ANIM_OFF);
-    if (s_out_pct_label) {
-        snprintf(b, sizeof(b), "%d%%", out_pct);
-        lv_label_set_text(s_out_pct_label, b);
+    if (reset_w) {
+        if (reset_abs && reset_abs[0]) snprintf(b, sizeof(b), "reset %s", reset_abs);
+        else                            snprintf(b, sizeof(b), "reset --");
+        lv_label_set_text(reset_w, b);
     }
+    if (bar_w) {
+        lv_bar_set_value(bar_w, used_pct < 0 ? 0 : used_pct, LV_ANIM_OFF);
+    }
+}
 
-    // COST row
-    if (s_cost_value) {
-        snprintf(b, sizeof(b), "$%.2f", cost_usd);
-        lv_label_set_text(s_cost_value, b);
-    }
-    int cost_pct = (int)(cost_usd * 100.0f / CLAUDE_COST_BAR_MAX);
-    if (cost_pct > 100) cost_pct = 100;
-    if (s_cost_pct_label) {
-        snprintf(b, sizeof(b), "%d%%", cost_pct);
-        lv_label_set_text(s_cost_pct_label, b);
-    }
-    if (s_cost_bar) lv_bar_set_value(s_cost_bar, cost_pct, LV_ANIM_OFF);
+// Stub — Claude page no longer renders 5h/7d bars (API-key users have no quota).
+// Server still pushes the fields, but we ignore them. If user later switches to OAuth,
+// the bars can come back; for now today's cost+tokens carry the same info.
+void ui_set_claude_quota(int five_h_used_pct, const char* five_h_reset_abs,
+                         int seven_d_used_pct, const char* seven_d_reset_abs) {
+    (void)five_h_used_pct;  (void)five_h_reset_abs;
+    (void)seven_d_used_pct; (void)seven_d_reset_abs;
+}
 
-    // Right-arc mode text
-    if (s_mode_value) {
-        lv_label_set_text(s_mode_value, busy ? "BUSY" : "IDLE");
-    }
+// Stat row constants — mirror what mk_stat_row uses, needed here for dynamic leader sizing.
+static constexpr int STAT_LEADER_X = 130;
+static constexpr int STAT_VALUE_X  = 312;
+static constexpr int STAT_VALUE_W  = 100;
 
+// Set a stat row's value text AND shrink/grow the leader line so it ends just before
+// the value text actually starts (otherwise short values like "$3.50" leave a big
+// gap on the right while the line abuts the label on the left — looks unbalanced).
+static void set_stat_value_locked(lv_obj_t* leader, lv_obj_t* value, const char* text) {
+    if (!value || !text) return;
+    lv_label_set_text(value, text);
+    if (!leader) return;
+    lv_point_t sz;
+    lv_text_get_size(&sz, text, &lv_font_montserrat_24, 0, 0,
+                     LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    int visible_left = STAT_VALUE_X + STAT_VALUE_W - sz.x;
+    int new_w = visible_left - STAT_LEADER_X - 10;   // 10px gap before value
+    if (new_w < 20) new_w = 20;
+    lv_obj_set_width(leader, new_w);
+}
+
+// Cost + tokens go in the TODAY / TOKENS rows on the Claude main page.
+// They also feed the Claude half of the dashboard (big %, token bar, cost text).
+void ui_set_claude_summary(float today_cost_usd, int today_tokens, const char* hhmm) {
+    char cost[16], tok[16];
+    snprintf(cost, sizeof(cost), "$%.2f", today_cost_usd);
+    if (today_tokens >= 1000000)      snprintf(tok, sizeof(tok), "%.1fM", today_tokens / 1e6);
+    else if (today_tokens >= 1000)    snprintf(tok, sizeof(tok), "%.1fK", today_tokens / 1e3);
+    else                              snprintf(tok, sizeof(tok), "%d", today_tokens);
+
+    // Dashboard derived values.
+    int used_pct = today_tokens > 0
+                   ? (int)((int64_t)today_tokens * 100 / CLAUDE_DAILY_TOKEN_CAP)
+                   : 0;
+    if (used_pct > 100) used_pct = 100;
+    int remain_pct = 100 - used_pct;
+    char big_buf[8];
+    snprintf(big_buf, sizeof(big_buf), "%d%%", remain_pct);
+
+    if (!lvgl_lock()) return;
+    // Main page widgets.
+    set_stat_value_locked(s_claude_today_leader,  s_claude_today_value,  cost);
+    set_stat_value_locked(s_claude_tokens_leader, s_claude_tokens_value, tok);
+    if (s_claude_summary) lv_label_set_text(s_claude_summary,
+                                            (hhmm && hhmm[0]) ? hhmm : "--:--");
+    // Dashboard widgets.
+    if (s_dash_claude_big)       lv_label_set_text(s_dash_claude_big, big_buf);
+    if (s_dash_claude_token_bar) lv_bar_set_value(s_dash_claude_token_bar, used_pct, LV_ANIM_OFF);
+    if (s_dash_claude_cost)      lv_label_set_text(s_dash_claude_cost, cost);
+    if (s_dash_clock)            lv_label_set_text(s_dash_clock,
+                                                   (hhmm && hhmm[0]) ? hhmm : "--:--");
     lvgl_unlock();
 }
 
 void ui_set_todos_progress(int done, int total, const char* current, const char* recent_done) {
-    (void)current; (void)recent_done;  // new layout only shows X/Y count.
+    (void)current; (void)recent_done;
     if (!s_todos_label) return;
     if (!lvgl_lock()) return;
-    char b[24];
-    snprintf(b, sizeof(b), "%d / %d", done, total);
+    char b[32];
+    snprintf(b, sizeof(b), "TodoList  %d / %d", done, total);
     lv_label_set_text(s_todos_label, b);
+    lv_obj_clear_flag(s_todos_label, LV_OBJ_FLAG_HIDDEN);
     lvgl_unlock();
 }
 
-void ui_set_codex_limits(int five_hour_left_pct, const char* five_hour_reset,
-                         int week_left_pct, const char* week_reset) {
-    // Server still sends `left_pct` (kept stable so ws_client.cpp doesn't change),
-    // but UI now shows "% used" — progress bars feel more natural that way.
+void ui_set_codex_limits(int five_hour_left_pct, const char* five_hour_reset_abs,
+                         int week_left_pct, const char* week_reset_abs) {
     if (!lvgl_lock()) return;
-    char b[96];
+    int used_5h = (five_hour_left_pct >= 0 && five_hour_left_pct <= 100)
+                  ? (100 - five_hour_left_pct) : -1;
+    int used_wk = (week_left_pct >= 0 && week_left_pct <= 100)
+                  ? (100 - week_left_pct) : -1;
+    update_quota_row_locked(s_codex_5h_label, s_codex_5h_pct,
+                            s_codex_5h_reset, s_codex_5h_bar,
+                            "5H", used_5h, five_hour_reset_abs);
+    update_quota_row_locked(s_codex_7d_label, s_codex_7d_pct,
+                            s_codex_7d_reset, s_codex_7d_bar,
+                            "7D", used_wk, week_reset_abs);
+    // Arcs mirror the bars (fill = used%). Effort arc is overridden by
+    // ui_set_codex_effort_arc when a live reasoning level arrives.
+    int u5 = (used_5h >= 0) ? used_5h : 0;
+    int u7 = (used_wk >= 0) ? used_wk : 0;
+    if (s_codex_model_arc)  lv_arc_set_value(s_codex_model_arc,  u5);
+    if (s_codex_effort_arc) lv_arc_set_value(s_codex_effort_arc, u7);
 
-    if (five_hour_left_pct < 0) five_hour_left_pct = 0;
-    if (five_hour_left_pct > 100) five_hour_left_pct = 100;
-    if (week_left_pct < 0) week_left_pct = 0;
-    if (week_left_pct > 100) week_left_pct = 100;
-
-    int used_5h = 100 - five_hour_left_pct;
-    int used_wk = 100 - week_left_pct;
-
-    if (s_codex_5h_value) {
-        snprintf(b, sizeof(b), "%d%% used", used_5h);
-        lv_label_set_text(s_codex_5h_value, b);
+    // Dashboard Codex half.
+    if (s_dash_codex_big) {
+        char b[16];
+        int p = five_hour_left_pct;
+        if (p < 0)        snprintf(b, sizeof(b), "--%%");
+        else if (p > 100) snprintf(b, sizeof(b), "100%%");
+        else              snprintf(b, sizeof(b), "%d%%", p);
+        lv_label_set_text(s_dash_codex_big, b);
     }
-    if (s_codex_5h_bar) {
-        lv_bar_set_value(s_codex_5h_bar, used_5h, LV_ANIM_OFF);
+    if (s_dash_codex_5h_bar) lv_bar_set_value(s_dash_codex_5h_bar, u5, LV_ANIM_OFF);
+    if (s_dash_codex_7d_bar) lv_bar_set_value(s_dash_codex_7d_bar, u7, LV_ANIM_OFF);
+    if (s_dash_codex_5h_rst) {
+        char b[20];
+        snprintf(b, sizeof(b), "reset %s",
+                 (five_hour_reset_abs && five_hour_reset_abs[0]) ? five_hour_reset_abs : "--");
+        lv_label_set_text(s_dash_codex_5h_rst, b);
     }
-    if (s_codex_5h_pct_label) {
-        snprintf(b, sizeof(b), "%d%%", used_5h);
-        lv_label_set_text(s_codex_5h_pct_label, b);
+    if (s_dash_codex_7d_rst) {
+        char b[24];
+        snprintf(b, sizeof(b), "reset %s",
+                 (week_reset_abs && week_reset_abs[0]) ? week_reset_abs : "--");
+        lv_label_set_text(s_dash_codex_7d_rst, b);
     }
-
-    if (s_codex_week_value) {
-        snprintf(b, sizeof(b), "%d%% used", used_wk);
-        lv_label_set_text(s_codex_week_value, b);
-    }
-    if (s_codex_week_bar) {
-        lv_bar_set_value(s_codex_week_bar, used_wk, LV_ANIM_OFF);
-    }
-    if (s_codex_week_pct_label) {
-        snprintf(b, sizeof(b), "%d%%", used_wk);
-        lv_label_set_text(s_codex_week_pct_label, b);
-    }
-
-    // Reset times intentionally not displayed — quota source not wired up
-    // yet, so the values would be empty placeholders.
-    (void)five_hour_reset;
-    (void)week_reset;
     lvgl_unlock();
 }
 
@@ -824,6 +1286,14 @@ void ui_set_transcript(const char* text) {
         lv_label_set_text(s_transcript_label, text);
         lvgl_unlock();
     }
+}
+
+void ui_set_codex_effort_arc(int effort_pct) {
+    if (effort_pct < 0) effort_pct = 0;
+    if (effort_pct > 100) effort_pct = 100;
+    if (!lvgl_lock()) return;
+    if (s_codex_effort_arc) lv_arc_set_value(s_codex_effort_arc, effort_pct);
+    lvgl_unlock();
 }
 
 void ui_set_todos_statuses(const char* statuses) {
@@ -858,29 +1328,16 @@ void ui_set_todos_statuses(const char* statuses) {
 }
 
 void ui_set_codex_activity(int today_min, int today_pct, int week_min, int week_pct) {
-    if (today_pct < 0) today_pct = 0;
-    if (today_pct > 100) today_pct = 100;
-    if (week_pct  < 0) week_pct  = 0;
-    if (week_pct  > 100) week_pct  = 100;
+    (void)today_pct; (void)week_pct;  // no caps make % meaningless here
     if (!lvgl_lock()) return;
     char b[24];
     if (s_codex_today_value) {
-        snprintf(b, sizeof(b), "%d min", today_min);
+        snprintf(b, sizeof(b), "DAY  %d m", today_min);
         lv_label_set_text(s_codex_today_value, b);
     }
-    if (s_codex_today_bar) lv_bar_set_value(s_codex_today_bar, today_pct, LV_ANIM_OFF);
-    if (s_codex_today_pct) {
-        snprintf(b, sizeof(b), "%d%%", today_pct);
-        lv_label_set_text(s_codex_today_pct, b);
-    }
     if (s_codex_actweek_value) {
-        snprintf(b, sizeof(b), "%d min", week_min);
+        snprintf(b, sizeof(b), "WK  %d m", week_min);
         lv_label_set_text(s_codex_actweek_value, b);
-    }
-    if (s_codex_actweek_bar) lv_bar_set_value(s_codex_actweek_bar, week_pct, LV_ANIM_OFF);
-    if (s_codex_actweek_pct) {
-        snprintf(b, sizeof(b), "%d%%", week_pct);
-        lv_label_set_text(s_codex_actweek_pct, b);
     }
     lvgl_unlock();
 }
@@ -973,12 +1430,26 @@ static void touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data) {
 }
 
 static void gesture_cb(lv_event_t* e) {
+    (void)e;
     lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
     lv_obj_t* cur = lv_screen_active();
     if (dir == LV_DIR_LEFT && cur == s_scr_claude && s_scr_codex) {
         lv_screen_load_anim(s_scr_codex, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
     } else if (dir == LV_DIR_RIGHT && cur == s_scr_codex && s_scr_claude) {
         lv_screen_load_anim(s_scr_claude, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
+    } else if (dir == LV_DIR_TOP && (cur == s_scr_claude || cur == s_scr_codex)
+               && s_scr_dashboard) {
+        s_last_main = cur;
+        lv_screen_load_anim(s_scr_dashboard, LV_SCR_LOAD_ANIM_MOVE_TOP, 250, 0, false);
+    } else if (dir == LV_DIR_BOTTOM && cur == s_scr_dashboard && s_last_main) {
+        lv_screen_load_anim(s_last_main, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 250, 0, false);
+    } else if (dir == LV_DIR_BOTTOM && (cur == s_scr_claude || cur == s_scr_codex)
+               && s_scr_pet) {
+        // Down-swipe from a main → pet screen (the "above" cell of the nav cross).
+        s_last_main = cur;
+        lv_screen_load_anim(s_scr_pet, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 250, 0, false);
+    } else if (dir == LV_DIR_TOP && cur == s_scr_pet && s_last_main) {
+        lv_screen_load_anim(s_last_main, LV_SCR_LOAD_ANIM_MOVE_TOP, 250, 0, false);
     }
 }
 
@@ -998,10 +1469,12 @@ void touch_init(i2c_bus_handle_t bus) {
     lv_indev_set_read_cb(indev, touch_read_cb);
     lv_indev_set_display(indev, s_lv_disp);
 
-    // Register gesture handler on both screens.
+    // Register gesture handler on every nav screen.
     if (lvgl_lock()) {
-        if (s_scr_claude) lv_obj_add_event_cb(s_scr_claude, gesture_cb, LV_EVENT_GESTURE, nullptr);
-        if (s_scr_codex)  lv_obj_add_event_cb(s_scr_codex,  gesture_cb, LV_EVENT_GESTURE, nullptr);
+        if (s_scr_claude)    lv_obj_add_event_cb(s_scr_claude,    gesture_cb, LV_EVENT_GESTURE, nullptr);
+        if (s_scr_codex)     lv_obj_add_event_cb(s_scr_codex,     gesture_cb, LV_EVENT_GESTURE, nullptr);
+        if (s_scr_dashboard) lv_obj_add_event_cb(s_scr_dashboard, gesture_cb, LV_EVENT_GESTURE, nullptr);
+        if (s_scr_pet)       lv_obj_add_event_cb(s_scr_pet,       gesture_cb, LV_EVENT_GESTURE, nullptr);
         lvgl_unlock();
     }
 }

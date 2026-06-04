@@ -1,8 +1,10 @@
-# Custom partition table for mic-test.
-# Default factory app slot is 1MB which fills up once LVGL is linked.
-# Bump to 4MB on the 16MB flash, leaves plenty of room for OTA/spiffs later.
-# Name,   Type, SubType, Offset,   Size,    Flags
-nvs,      data, nvs,     0x9000,   0x6000,
-phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x400000,
-storage,  data, spiffs,  0x410000, 0xb00000,
+# OTA-capable layout: two 3.5MB app slots + 8MB storage.
+# After this is flashed once via USB, future updates can come over the air
+# (esp_https_ota writes the inactive slot, otadata flips, esp_restart).
+# Name,   Type, SubType, Offset,    Size,     Flags
+nvs,      data, nvs,     0x9000,    0x6000,
+phy_init, data, phy,     0xf000,    0x1000,
+otadata,  data, ota,     0x11000,   0x2000,
+ota_0,    app,  ota_0,   0x20000,   0x350000,
+ota_1,    app,  ota_1,   0x370000,  0x350000,
+storage,  data, spiffs,  0x6c0000,  0x940000,

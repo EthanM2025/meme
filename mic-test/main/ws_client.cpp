@@ -49,6 +49,31 @@ static void handle_state_json(const char* payload, int len) {
     cJSON* codex_effort = cJSON_GetObjectItem(root, "codex_effort");
     if (cJSON_IsString(codex_effort)) ui_set_codex_effort(codex_effort->valuestring);
 
+    cJSON* effort_pct = cJSON_GetObjectItem(root, "codex_effort_pct");
+    if (cJSON_IsNumber(effort_pct)) ui_set_codex_effort_arc((int)effort_pct->valuedouble);
+
+    cJSON* c5h    = cJSON_GetObjectItem(root, "claude_5h_used_pct");
+    cJSON* c5h_ra = cJSON_GetObjectItem(root, "claude_5h_reset_abs");
+    cJSON* c7d    = cJSON_GetObjectItem(root, "claude_7d_used_pct");
+    cJSON* c7d_ra = cJSON_GetObjectItem(root, "claude_7d_reset_abs");
+    {
+        int  v5 = cJSON_IsNumber(c5h) ? (int)c5h->valuedouble : -1;
+        int  v7 = cJSON_IsNumber(c7d) ? (int)c7d->valuedouble : -1;
+        const char* r5 = cJSON_IsString(c5h_ra) ? c5h_ra->valuestring : "";
+        const char* r7 = cJSON_IsString(c7d_ra) ? c7d_ra->valuestring : "";
+        ui_set_claude_quota(v5, r5, v7, r7);
+    }
+
+    cJSON* today_cost = cJSON_GetObjectItem(root, "claude_today_cost_usd");
+    cJSON* today_tok  = cJSON_GetObjectItem(root, "claude_today_tokens");
+    cJSON* hhmm       = cJSON_GetObjectItem(root, "mac_hhmm");
+    if (cJSON_IsNumber(today_cost) || cJSON_IsNumber(today_tok) || cJSON_IsString(hhmm)) {
+        float cost = cJSON_IsNumber(today_cost) ? (float)today_cost->valuedouble : 0.0f;
+        int   tok  = cJSON_IsNumber(today_tok)  ? (int)today_tok->valuedouble    : 0;
+        const char* hm = cJSON_IsString(hhmm) ? hhmm->valuestring : "";
+        ui_set_claude_summary(cost, tok, hm);
+    }
+
     // Claude metrics: tokens_out + cost_usd + busy → combined setter.
     cJSON* out  = cJSON_GetObjectItem(root, "tokens_out");
     cJSON* cost = cJSON_GetObjectItem(root, "cost_usd");
@@ -87,14 +112,15 @@ static void handle_state_json(const char* payload, int len) {
     }
 
     cJSON* codex_5h_left   = cJSON_GetObjectItem(root, "codex_5h_left_pct");
-    cJSON* codex_5h_reset  = cJSON_GetObjectItem(root, "codex_5h_reset");
+    cJSON* codex_5h_abs    = cJSON_GetObjectItem(root, "codex_5h_reset_abs");
     cJSON* codex_week_left = cJSON_GetObjectItem(root, "codex_week_left_pct");
-    cJSON* codex_week_rst  = cJSON_GetObjectItem(root, "codex_week_reset");
-    if (cJSON_IsNumber(codex_5h_left) && cJSON_IsNumber(codex_week_left)) {
-        const char* r5 = cJSON_IsString(codex_5h_reset) ? codex_5h_reset->valuestring : "";
-        const char* rw = cJSON_IsString(codex_week_rst) ? codex_week_rst->valuestring : "";
-        ui_set_codex_limits((int)codex_5h_left->valuedouble, r5,
-                            (int)codex_week_left->valuedouble, rw);
+    cJSON* codex_week_abs  = cJSON_GetObjectItem(root, "codex_week_reset_abs");
+    {
+        int v5 = cJSON_IsNumber(codex_5h_left)   ? (int)codex_5h_left->valuedouble   : -1;
+        int vw = cJSON_IsNumber(codex_week_left) ? (int)codex_week_left->valuedouble : -1;
+        const char* r5 = cJSON_IsString(codex_5h_abs)   ? codex_5h_abs->valuestring   : "";
+        const char* rw = cJSON_IsString(codex_week_abs) ? codex_week_abs->valuestring : "";
+        ui_set_codex_limits(v5, r5, vw, rw);
     }
 
     cJSON* transcript = cJSON_GetObjectItem(root, "transcript");

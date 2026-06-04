@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +17,10 @@ bool wifi_try_connect_from_nvs(int timeout_ms);
 void wifi_start_provisioning(void);
 
 bool wifi_is_connected(void);
+
+// Read the user-configured Mac hostname (set via SoftAP) into `buf`.
+// Returns true if a host was saved. Falls back to compile-time default in main.cpp.
+bool wifi_get_mac_host(char* buf, size_t buf_size);
 
 #ifdef __cplusplus
 }

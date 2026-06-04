@@ -11,22 +11,53 @@ Designed to be polled (`get_state()`) — no FS-watcher dependency.
 """
 from __future__ import annotations
 
+import datetime
 import glob
 import json
 import os
+import ssl
+import subprocess
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Optional
 
-CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+CLAUDE_PROJECTS  = os.path.expanduser("~/.claude/projects")
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code public client id
+CLAUDE_USER_AGENT = "claude-code/2.1.121"
+HTTP_TIMEOUT  = 8
+QUOTA_CACHE_S = 60
 
-# Rough per-1M-token pricing in USD for Claude API public list prices (2026-05-25).
-# These are approximate — Claude Code subscription pricing differs but this gives a
-# usage-cost feel that's useful on the device. Update as Anthropic publishes new rates.
+try:
+    import certifi
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    _SSL_CTX = ssl.create_default_context()
+
+_last_quota_ts = 0.0
+_last_quota: dict[str, Any] = {}
+
+# Per-1M-token USD rates. Table refreshed from alexjc-tech/cc-island (mid-2026).
+# Includes the gpt-5.x family for when we eventually parse Codex session logs.
+# Tuple order matches cc-island for easy cross-reference: (in, out, cache_create, cache_read).
 MODEL_PRICING = {
-    "claude-opus-4-7":      {"in":  15.0, "cache_read": 1.5,  "cache_create": 18.75, "out": 75.0},
-    "claude-sonnet-4-6":    {"in":   3.0, "cache_read": 0.3,  "cache_create":  3.75, "out": 15.0},
-    "claude-haiku-4-5":     {"in":   1.0, "cache_read": 0.1,  "cache_create":  1.25, "out":  5.0},
-    "claude-haiku-4-5-20251001": {"in": 1.0, "cache_read": 0.1, "cache_create": 1.25, "out": 5.0},
+    "claude-opus-4-8":      {"in":  5.0, "cache_read": 0.50, "cache_create": 6.25, "out": 25.0},
+    "claude-opus-4-7":      {"in":  5.0, "cache_read": 0.50, "cache_create": 6.25, "out": 25.0},
+    "claude-opus-4-6":      {"in":  5.0, "cache_read": 0.50, "cache_create": 6.25, "out": 25.0},
+    "claude-opus-4-5":      {"in":  5.0, "cache_read": 0.50, "cache_create": 6.25, "out": 25.0},
+    "claude-sonnet-4-6":    {"in":  3.0, "cache_read": 0.30, "cache_create": 3.75, "out": 15.0},
+    "claude-sonnet-4-5":    {"in":  3.0, "cache_read": 0.30, "cache_create": 3.75, "out": 15.0},
+    "claude-haiku-4-5":     {"in":  1.0, "cache_read": 0.10, "cache_create": 1.25, "out":  5.0},
+    "claude-haiku-4-5-20251001": {"in": 1.0, "cache_read": 0.10, "cache_create": 1.25, "out": 5.0},
+    # Codex / OpenAI side — kept here for when claude_adapter eventually
+    # also reads ~/.codex/logs_*.sqlite for combined cost tracking.
+    "gpt-5.5":              {"in":  5.0,  "cache_read": 0.50,  "cache_create": 5.0,   "out": 30.0},
+    "gpt-5.4":              {"in":  2.5,  "cache_read": 0.25,  "cache_create": 2.5,   "out": 15.0},
+    "gpt-5.2":              {"in":  1.75, "cache_read": 0.175, "cache_create": 1.75,  "out": 14.0},
+    "gpt-5.4-mini":         {"in":  0.75, "cache_read": 0.075, "cache_create": 0.75,  "out":  4.5},
+    "gpt-5-codex":          {"in":  1.25, "cache_read": 0.125, "cache_create": 1.25,  "out": 10.0},
 }
 
 
@@ -60,12 +91,18 @@ def parse_session(jsonl_path: str) -> dict:
         "total_cache_read": 0,
         "total_output": 0,
         "estimated_cost_usd": 0.0,
+        "today_output_tokens": 0,
+        "today_cost_usd": 0.0,
         "turn_count": 0,
+        "first_turn_ts": None,
         "last_turn_ts": None,
+        "latest_input_tokens": 0,  # input + cache_read of the most recent turn (approx context window use)
         "todos": [],
         "busy": False,            # True if the latest assistant turn used a tool (i.e. work in progress)
     }
     last_assistant_tool_use = False
+    today_midnight = datetime.datetime.now().replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp()
 
     with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -93,7 +130,23 @@ def parse_session(jsonl_path: str) -> dict:
                 state["total_output"]       += out_t
                 state["estimated_cost_usd"] += _model_cost_usd(model or "", in_t, cc, cr, out_t)
                 state["turn_count"] += 1
-                state["last_turn_ts"] = d.get("timestamp")
+                ts = d.get("timestamp")
+                if ts:
+                    if state["first_turn_ts"] is None:
+                        state["first_turn_ts"] = ts
+                    state["last_turn_ts"] = ts
+                # Today-only spend tally (filter by timestamp >= midnight).
+                if ts:
+                    try:
+                        turn_ts = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        if turn_ts.astimezone().timestamp() >= today_midnight:
+                            state["today_output_tokens"] += out_t
+                            state["today_cost_usd"] += _model_cost_usd(
+                                model or "", in_t, cc, cr, out_t)
+                    except (ValueError, TypeError):
+                        pass
+                # Snapshot of context window use as of the latest turn.
+                state["latest_input_tokens"] = in_t + cr
 
                 # Detect tool use → "busy" hint.
                 content = m.get("content") or []
@@ -161,11 +214,222 @@ def parse_session(jsonl_path: str) -> dict:
     return state
 
 
+# ---------------------------------------------------------------------------
+# Claude Code 5h / 7d quota — hit api.anthropic.com/api/oauth/usage with the
+# OAuth token Claude Code stashed in the macOS keychain. Approach borrowed
+# from alexjc-tech/cc-island.
+# ---------------------------------------------------------------------------
+def _security(args: list[str]) -> Optional[subprocess.CompletedProcess]:
+    try:
+        return subprocess.run(["/usr/bin/security", *args],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _claude_keychain_account() -> Optional[str]:
+    out = _security(["find-generic-password", "-s", "Claude Code-credentials"])
+    if not out or out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith('"acct"'):
+            continue
+        if "=" not in line:
+            return None
+        v = line.split("=", 1)[1]
+        if v.startswith('"') and v.endswith('"') and len(v) >= 2:
+            return v[1:-1] or None
+    return None
+
+
+def _read_claude_creds() -> Optional[dict]:
+    account = _claude_keychain_account()
+    if not account:
+        return None
+    out = _security(["find-generic-password", "-s", "Claude Code-credentials",
+                     "-a", account, "-w"])
+    if not out or out.returncode != 0:
+        return None
+    try:
+        oauth = (json.loads(out.stdout.strip()).get("claudeAiOauth") or {})
+    except json.JSONDecodeError:
+        return None
+    if not oauth.get("accessToken") or not oauth.get("refreshToken"):
+        return None
+    return {"account": account, "oauth": oauth}
+
+
+def _write_claude_creds(account: str, oauth: dict) -> bool:
+    payload = json.dumps({"claudeAiOauth": oauth})
+    out = _security(["add-generic-password", "-U",
+                     "-s", "Claude Code-credentials", "-a", account, "-w", payload])
+    return bool(out and out.returncode == 0)
+
+
+def _http(method: str, url: str, headers: dict, body=None) -> tuple[int, Any]:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=_SSL_CTX) as r:
+            raw = r.read()
+            try:
+                return r.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return r.status, None
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except Exception:
+            return e.code, None
+    except Exception as e:
+        return 0, {"_transport_error": str(e)}
+
+
+def _refresh_claude_token(refresh_token: str) -> Optional[dict]:
+    status, obj = _http(
+        "POST", CLAUDE_TOKEN_URL,
+        headers={"Content-Type": "application/json"},
+        body={"grant_type": "refresh_token",
+              "refresh_token": refresh_token,
+              "client_id": CLAUDE_OAUTH_CLIENT_ID},
+    )
+    if status != 200 or not isinstance(obj, dict):
+        return None
+    if not obj.get("access_token") or not obj.get("refresh_token"):
+        return None
+    expires_in = obj.get("expires_in") or 28800
+    return {
+        "access_token":  obj["access_token"],
+        "refresh_token": obj["refresh_token"],
+        "expires_at":    int((time.time() + expires_in) * 1000),
+    }
+
+
+def _parse_reset_at(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        s = str(value).replace("Z", "+00:00")
+        return int(datetime.datetime.fromisoformat(s).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def _format_reset(reset_epoch: Optional[int]) -> str:
+    if not reset_epoch:
+        return ""
+    secs = reset_epoch - int(time.time())
+    if secs <= 0:
+        return ""
+    if secs >= 86400:  return f"in {secs // 86400}d"
+    if secs >= 3600:   return f"in {secs // 3600}h {(secs % 3600) // 60}m"
+    return f"in {secs // 60}m"
+
+
+def _format_reset_abs(reset_epoch: Optional[int]) -> str:
+    if not reset_epoch:
+        return ""
+    dt = datetime.datetime.fromtimestamp(reset_epoch)
+    if dt.date() == datetime.datetime.now().date():
+        return dt.strftime("%H:%M")
+    return dt.strftime("%-m/%-d %H:%M")
+
+
+def _probe_claude_usage(token: str) -> tuple[str, Any]:
+    """Return (kind, value). kind ∈ {ok, scope, err}."""
+    status, obj = _http(
+        "GET", CLAUDE_USAGE_URL,
+        headers={
+            "Authorization":   f"Bearer {token}",
+            "anthropic-beta":  "oauth-2025-04-20",
+            "Accept":          "application/json",
+            "Content-Type":    "application/json",
+            "User-Agent":      CLAUDE_USER_AGENT,
+        },
+    )
+    if status == 401:                              return "err", "unauthorized"
+    if status == 403:                              return "scope", "re-login"
+    if status == 429:                              return "err", "rate limited"
+    if status != 200 or not isinstance(obj, dict): return "err", f"http {status}"
+    if isinstance(obj.get("error"), dict) and obj["error"].get("type") == "rate_limit_error":
+        return "err", "rate limited"
+
+    def _win(key):
+        d = obj.get(key) or {}
+        raw = d.get("utilization", d.get("used_percent", 0)) or 0
+        used = int(round(float(raw))) if isinstance(raw, (int, float)) else 0
+        reset_epoch = _parse_reset_at(d.get("resets_at"))
+        return {"used_pct": used,
+                "reset": _format_reset(reset_epoch),
+                "reset_abs": _format_reset_abs(reset_epoch)}
+
+    return "ok", {"five_hour": _win("five_hour"), "seven_day": _win("seven_day")}
+
+
+def _fetch_claude_quota_uncached() -> dict:
+    """env token → keychain token → refresh + retry. Returns {} on failure."""
+    # 1) env override (Claude Desktop sets this for child procs)
+    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env_token:
+        kind, val = _probe_claude_usage(env_token)
+        if kind == "ok":
+            return val
+
+    creds = _read_claude_creds()
+    if not creds:
+        return {}
+    oauth = creds["oauth"]
+
+    # 2) keychain access token
+    kind, val = _probe_claude_usage(oauth["accessToken"])
+    if kind == "ok":
+        return val
+
+    # 3) refresh + retry
+    refreshed = _refresh_claude_token(oauth["refreshToken"])
+    if not refreshed:
+        return {}
+    oauth = dict(oauth)
+    oauth["accessToken"]  = refreshed["access_token"]
+    oauth["refreshToken"] = refreshed["refresh_token"]
+    oauth["expiresAt"]    = refreshed["expires_at"]
+    _write_claude_creds(creds["account"], oauth)
+
+    kind, val = _probe_claude_usage(refreshed["access_token"])
+    return val if kind == "ok" else {}
+
+
+def _get_cached_claude_quota() -> dict:
+    global _last_quota_ts, _last_quota
+    now = time.time()
+    if _last_quota and now - _last_quota_ts < QUOTA_CACHE_S:
+        return _last_quota
+    fresh = _fetch_claude_quota_uncached()
+    if fresh:
+        _last_quota = fresh
+        _last_quota_ts = now
+    return _last_quota
+
+
 def get_state() -> dict:
     fn = find_latest_session()
     if not fn:
-        return {"error": "no session log found"}
-    return parse_session(fn)
+        base = {"error": "no session log found"}
+    else:
+        base = parse_session(fn)
+    # Stitch in real 5h / 7d quota (from oauth/usage).
+    q = _get_cached_claude_quota()
+    if q:
+        base["five_hour_used_pct"]    = q.get("five_hour", {}).get("used_pct")
+        base["five_hour_reset"]       = q.get("five_hour", {}).get("reset", "")
+        base["five_hour_reset_abs"]   = q.get("five_hour", {}).get("reset_abs", "")
+        base["seven_day_used_pct"]    = q.get("seven_day", {}).get("used_pct")
+        base["seven_day_reset"]       = q.get("seven_day", {}).get("reset", "")
+        base["seven_day_reset_abs"]   = q.get("seven_day", {}).get("reset_abs", "")
+    return base
 
 
 def pretty_print(state: dict) -> None:

@@ -33,7 +33,8 @@ from doubao_asr import transcribe_wav
 from doubao_streaming import StreamingASRSession
 from paste import paste_to_active_window, get_active_app, press_enter
 from claude_adapter import get_state as get_claude_state
-from codex_adapter import get_state as get_codex_state
+from codex_adapter import get_state as get_codex_state, daemon_loop as codex_activity_daemon
+import threading
 import json as _json
 
 # Force line buffering so logs flush through tee/pipe in real time.
@@ -127,11 +128,35 @@ async def push_state_loop(ws):
             for t in todos[:24]:  # cap so payload stays small
                 s = t.get("status")
                 statuses += "c" if s == "completed" else ("i" if s == "in_progress" else "p")
+
+            # Arc fill percentages — wire formerly-decorative arcs to real data.
+            CONTEXT_WINDOW = 200_000              # tokens; matches Opus/Sonnet 4.x
+            SESSION_FULL_MIN = 240                 # 4 h session = full MODE arc
+            ctx_pct = min(100, int(claude.get("latest_input_tokens", 0) * 100 / CONTEXT_WINDOW)) if claude.get("latest_input_tokens") else 0
+            session_min = 0
+            first_ts, last_ts = claude.get("first_turn_ts"), claude.get("last_turn_ts")
+            if first_ts and last_ts:
+                try:
+                    import datetime
+                    f = datetime.datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+                    l = datetime.datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                    session_min = int((l - f).total_seconds() / 60)
+                except Exception:
+                    pass
+            session_pct = min(100, session_min * 100 // SESSION_FULL_MIN)
+            # Codex EFFORT arc — map level → fill %.
+            effort = (codex.get("codex_effort") or "").lower()
+            effort_pct = {"high": 100, "medium": 60, "low": 30}.get(effort, 0)
+
             payload = {
                 "model":                    claude.get("model") or "-",
                 "tokens_out":               claude.get("total_output", 0),
                 "cost_usd":                 round(claude.get("estimated_cost_usd", 0.0), 2),
                 "busy":                     bool(claude.get("busy", False)),
+                "claude_ctx_pct":           ctx_pct,
+                "claude_session_pct":       session_pct,
+                "claude_session_min":       session_min,
+                "codex_effort_pct":         effort_pct,
                 "todos_done":               done,
                 "todos_total":              len(todos),
                 "todos_current":            current,
@@ -149,6 +174,17 @@ async def push_state_loop(ws):
                 "codex_week_reset":         codex.get("codex_week_reset", ""),
                 "codex_model":              codex.get("codex_model", ""),
                 "codex_effort":             codex.get("codex_effort", ""),
+                "claude_5h_used_pct":       claude.get("five_hour_used_pct"),
+                "claude_5h_reset":          claude.get("five_hour_reset", ""),
+                "claude_5h_reset_abs":      claude.get("five_hour_reset_abs", ""),
+                "claude_7d_used_pct":       claude.get("seven_day_used_pct"),
+                "claude_7d_reset":          claude.get("seven_day_reset", ""),
+                "claude_7d_reset_abs":      claude.get("seven_day_reset_abs", ""),
+                "claude_today_cost_usd":    round(claude.get("today_cost_usd", 0.0), 2),
+                "claude_today_tokens":      int(claude.get("today_output_tokens", 0)),
+                "mac_hhmm":                 time.strftime("%H:%M"),
+                "codex_5h_reset_abs":       codex.get("five_hour_reset_abs", ""),
+                "codex_week_reset_abs":     codex.get("codex_week_reset_abs", ""),
                 "codex_status_ok":          codex.get("codex_status_ok", False),
                 "transcript":               "",
             }
@@ -321,11 +357,51 @@ async def handler(ws):
             print(f"[{time.strftime('%H:%M:%S')}] ✕ client gone")
 
 
+# Path to the built firmware image — served at GET /firmware.bin so the
+# device's esp_https_ota can pull and self-update over the LAN.
+FIRMWARE_BIN = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "mic-test", "build", "mic_test.bin",
+)
+
+
+async def http_or_ws(connection, request):
+    """websockets.serve `process_request` hook — intercepts non-WS HTTP
+    requests so we can serve /firmware.bin without standing up a second port.
+    Returns a Response to short-circuit; returns None to fall through to WS."""
+    path = request.path
+    if path == "/firmware.bin":
+        try:
+            with open(FIRMWARE_BIN, "rb") as f:
+                data = f.read()
+            print(f"[{time.strftime('%H:%M:%S')}] → /firmware.bin ({len(data)} bytes)")
+            from websockets.http11 import Response
+            from websockets.datastructures import Headers
+            return Response(
+                200, "OK",
+                Headers([("Content-Type", "application/octet-stream"),
+                         ("Content-Length", str(len(data)))]),
+                data,
+            )
+        except FileNotFoundError:
+            from websockets.http11 import Response
+            from websockets.datastructures import Headers
+            return Response(404, "Not Found", Headers(), b"firmware.bin not built\n")
+    return None
+
+
 async def main():
     print(f"WebSocket PCM ingest listening on ws://0.0.0.0:{PORT}/")
     print(f"Captures will be saved under {OUT_DIR}")
+    print(f"OTA firmware served at GET /firmware.bin → {FIRMWARE_BIN}")
+    # Codex.app focus-time tracker (every 5s polls macOS frontmost app and
+    # accumulates seconds when Codex.app is on top). Persists to
+    # ~/.codex/.stopwatch_usage.json. Used to feed Codex page DAY/WK rows.
+    threading.Thread(target=codex_activity_daemon, daemon=True,
+                     name="codex_activity").start()
     print("Press Ctrl+C to stop.\n")
-    async with websockets.serve(handler, "0.0.0.0", PORT, max_size=2**20):
+    async with websockets.serve(handler, "0.0.0.0", PORT, max_size=2**20,
+                                 process_request=http_or_ws):
         await asyncio.Future()  # run forever
 
 

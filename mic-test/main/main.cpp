@@ -19,13 +19,16 @@
 #include "buttons.h"
 #include "display.h"
 #include "mdns.h"
+#include "esp_https_ota.h"
+#include "esp_http_client.h"
+#include "esp_ota_ops.h"
+#include "esp_app_format.h"
 
-// === EDIT THIS LINE FOR YOUR MAC ===
-// We resolve the Mac by its mDNS hostname so the device follows it across
-// WiFi/DHCP changes — no reflash needed when the Mac IP rotates. The hostname
-// is what `scutil --get LocalHostName` prints on your Mac
-// (System Settings → General → Sharing → Local hostname).
-#define MAC_WS_URI "ws://Ethan-MacBook-Air.local:8765/"
+// Default Mac mDNS hostname — used only if no `host` has been saved via the
+// SoftAP page. Users on a different Mac just set their hostname in the SoftAP
+// form once and never have to reflash.
+#define DEFAULT_MAC_HOST "Ethan-MacBook-Air.local"
+#define MAC_WS_PORT      8765
 
 static const char* TAG = "mic-test";
 
@@ -200,6 +203,88 @@ static void maybe_enter_idle_sleep() {
     }
 }
 
+// OTA check task — once per boot, ~30s after WiFi is up, fetch the Mac's
+// /firmware.bin endpoint. esp_https_ota compares the running image's version
+// to the new image's header version (we stamp it with a build timestamp in
+// the top-level CMakeLists.txt, so any rebuild → mismatch → update applies).
+// No update needed → returns ESP_ERR_OTA_VALIDATE_FAILED ≈ NOOP.
+static void ota_check_task(void*) {
+    vTaskDelay(pdMS_TO_TICKS(30000));  // first check 30s after boot, then every 5 min
+
+    char host[64] = {0};
+    if (!wifi_get_mac_host(host, sizeof(host)) || !host[0]) {
+        strncpy(host, DEFAULT_MAC_HOST, sizeof(host) - 1);
+    }
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/firmware.bin", host, MAC_WS_PORT);
+
+    while (true) {
+        esp_http_client_config_t http_cfg = {};
+        http_cfg.url        = url;
+        http_cfg.timeout_ms = 10000;
+        http_cfg.keep_alive_enable = true;
+
+        esp_https_ota_config_t ota_cfg = {};
+        ota_cfg.http_config = &http_cfg;
+
+        ESP_LOGI(TAG, "OTA check: %s", url);
+
+        // Low-level path so we can compare versions ourselves — the default
+        // `esp_https_ota()` refuses when versions match, but our CMake
+        // version-stamping only updates on reconfigure, not every build.
+        // We compare SHA-256 instead (different on any source change).
+        esp_https_ota_handle_t handle = NULL;
+        esp_err_t r = esp_https_ota_begin(&ota_cfg, &handle);
+        if (r != ESP_OK) {
+            ESP_LOGW(TAG, "OTA begin: %s", esp_err_to_name(r));
+            vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000));
+            continue;
+        }
+
+        esp_app_desc_t new_desc;
+        if (esp_https_ota_get_img_desc(handle, &new_desc) == ESP_OK) {
+            const esp_app_desc_t* running = esp_app_get_description();
+            bool same = (memcmp(new_desc.app_elf_sha256, running->app_elf_sha256,
+                                sizeof(new_desc.app_elf_sha256)) == 0);
+            if (same) {
+                ESP_LOGI(TAG, "OTA: same SHA-256, skipping");
+                esp_https_ota_abort(handle);
+                vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000));
+                continue;
+            }
+            ESP_LOGI(TAG, "OTA: new image differs, applying");
+        }
+
+        while ((r = esp_https_ota_perform(handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            // download chunks
+        }
+        if (r == ESP_OK && esp_https_ota_is_complete_data_received(handle)) {
+            if (esp_https_ota_finish(handle) == ESP_OK) {
+                ESP_LOGI(TAG, "OTA: success, rebooting");
+                vTaskDelay(pdMS_TO_TICKS(500));
+                esp_restart();
+            } else {
+                ESP_LOGW(TAG, "OTA finish failed");
+            }
+        } else {
+            ESP_LOGW(TAG, "OTA perform: %s", esp_err_to_name(r));
+            esp_https_ota_abort(handle);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000));  // 5 minutes
+    }
+}
+
+// Confirm we boot OK after an OTA so the loader doesn't roll us back.
+static void ota_mark_valid(void) {
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGI(TAG, "OTA: marking running image valid");
+        esp_ota_mark_app_valid_cancel_rollback();
+    }
+}
+
 // Battery poller — reads PMIC Vbat (battery voltage in mV) and Vin (USB input
 // voltage in mV) every 10s, then pushes the percentage + charging state to
 // the display. LiPo voltage curve approximated linearly between 3.30V (0%)
@@ -331,7 +416,7 @@ extern "C" void app_main() {
     touch_init(g_i2c_bus);
 
     wifi_init();
-    bool ok = wifi_try_connect_from_nvs(8000);
+    bool ok = wifi_try_connect_from_nvs(15000);
     if (!ok) {
         wifi_start_provisioning();
         ui_show_wifi_setup("Meme-9515", "192.168.4.1");
@@ -353,10 +438,21 @@ extern "C" void app_main() {
         ESP_LOGW(TAG, "mdns_init failed — .local hostname won't resolve");
     }
 
-    ws_start(MAC_WS_URI);
+    // Resolve Mac hostname: NVS override (via SoftAP) > compile-time default.
+    char host[64] = {0};
+    if (!wifi_get_mac_host(host, sizeof(host)) || !host[0]) {
+        strncpy(host, DEFAULT_MAC_HOST, sizeof(host) - 1);
+    }
+    char ws_uri[96];
+    snprintf(ws_uri, sizeof(ws_uri), "ws://%s:%d/", host, MAC_WS_PORT);
+    ESP_LOGI(TAG, "ws uri: %s", ws_uri);
+    ws_start(ws_uri);
     note_activity();
+
+    ota_mark_valid();
 
     xTaskCreate(mic_task, "mic", 4096, nullptr, 5, nullptr);
     xTaskCreate(battery_task, "battery", 3072, nullptr, 2, nullptr);
+    xTaskCreate(ota_check_task, "ota", 8192, nullptr, 3, nullptr);
     ESP_LOGI(TAG, "ready — hold button A to talk");
 }

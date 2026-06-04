@@ -18,9 +18,15 @@ CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_18=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
 CONFIG_LV_FONT_MONTSERRAT_36=y
+CONFIG_LV_FONT_MONTSERRAT_48=y
 
 # Required by our generated CJK font (lv_font_cjk_14.c):
 #   - LV_USE_FONT_COMPRESSED: the font uses bitmap_format=1 (RLE-compressed glyphs)
 #   - LV_FONT_FMT_TXT_LARGE:  font has ~21k glyphs, exceeds the small offset table format
 CONFIG_LV_USE_FONT_COMPRESSED=y
 CONFIG_LV_FONT_FMT_TXT_LARGE=y
+
+# OTA: allow plain http:// in esp_https_ota (we're on LAN, no TLS).
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+# Use ota_0 / ota_1 / otadata layout from partitions.csv (set above).
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n

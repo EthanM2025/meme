@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Meme — UI preview (proposed quota row layout)</title>
+<style>
+  body {
+    font-family: -apple-system, "Helvetica Neue", "PingFang SC", sans-serif;
+    background: #1a1a1a;
+    color: #ccc;
+    margin: 0;
+    padding: 24px;
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .frame {
+    width: 466px;
+    height: 466px;
+    background: #000;
+    border-radius: 50%;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 0 0 6px #222, 0 0 40px rgba(0,0,0,.8);
+  }
+  .label {
+    position: absolute;
+    color: #f2eaf9;
+    font-size: 14px;
+    line-height: 1;
+  }
+  .title {
+    position: absolute;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    top: 26px;
+  }
+  .title img { width: 40px; height: 40px; }
+  .title span { font-size: 24px; font-weight: 600; line-height: 1; }
+  .claude .title span { color: #FF6B35; }
+  .codex .title span { color: #25C7FF; }
+
+  /* arc — drawn with svg */
+  .arc {
+    position: absolute;
+    width: 92px;
+    height: 92px;
+  }
+  .arc .bg, .arc .fg {
+    fill: none;
+    stroke-width: 7;
+    stroke-linecap: butt;
+  }
+  .arc .bg { stroke: #343246; }
+  .arc-text {
+    position: absolute;
+    width: 92px;
+    text-align: center;
+    color: #f2eaf9;
+    font-size: 14px;
+    line-height: 1;
+  }
+  .arc-text.value {
+    font-size: 18px;
+    font-weight: 600;
+    color: #fff;
+  }
+  .arc-text.sub {
+    font-size: 14px;
+    color: #d8d0f0;
+  }
+
+  /* pet placeholder */
+  .pet {
+    position: absolute;
+    width: 70px;
+    height: 60px;
+    left: 50%;
+    transform: translateX(-50%);
+    top: 130px;
+    background: #ff8a3d;
+    border-radius: 10px;
+  }
+  .pet:before, .pet:after {
+    content: '';
+    position: absolute;
+    width: 8px; height: 10px;
+    background: #000;
+    top: 18px;
+  }
+  .pet:before { left: 18px; }
+  .pet:after  { right: 18px; }
+
+  /* quota row — proposed layout */
+  .qrow {
+    position: absolute;
+    left: 64px;
+    right: 64px;
+    height: 30px;
+  }
+  .qrow .qlabel {
+    position: absolute;
+    left: 0;
+    top: 4px;
+    font-size: 18px;
+    font-weight: 600;
+    color: #fff;
+  }
+  .qrow .qbar {
+    position: absolute;
+    left: 48px;
+    right: 90px;
+    top: 12px;
+    height: 10px;
+    background: #303042;
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .qrow .qbar > .fill {
+    height: 100%;
+    border-radius: 5px;
+  }
+  .qrow .qpct {
+    position: absolute;
+    right: 0;
+    top: -2px;
+    font-size: 24px;
+    font-weight: 600;
+  }
+  .qrow .qreset {
+    position: absolute;
+    right: 90px;
+    top: -4px;
+    font-size: 12px;
+    color: #888;
+  }
+  .claude .qbar > .fill, .claude .qpct { background: transparent; }
+  .claude .qbar > .fill { background: #FF6B35; }
+  .claude .qpct { color: #FF6B35; }
+  .codex  .qbar > .fill { background: #25C7FF; }
+  .codex  .qpct { color: #25C7FF; }
+
+  /* todolist line */
+  .todolist {
+    position: absolute;
+    left: 0; right: 0;
+    text-align: center;
+    color: #F3EEF8;
+    font-size: 18px;
+    font-weight: 600;
+  }
+  .dots {
+    position: absolute;
+    left: 0; right: 0;
+    display: flex;
+    justify-content: center;
+    gap: 4px;
+  }
+  .dots span {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+
+  /* summary line */
+  .summary {
+    position: absolute;
+    left: 0; right: 0;
+    text-align: center;
+    color: #cccccc;
+    font-size: 14px;
+  }
+
+  /* activity line (codex) */
+  .activity {
+    position: absolute;
+    left: 0; right: 0;
+    text-align: center;
+    color: #cccccc;
+    font-size: 14px;
+  }
+
+  /* battery */
+  .battery {
+    position: absolute;
+    left: 0; right: 0;
+    bottom: 16px;
+    text-align: center;
+    color: #888;
+    font-size: 14px;
+  }
+
+  h2 {
+    color: #eee;
+    margin: 0;
+    text-align: center;
+    font-size: 16px;
+    font-weight: 500;
+  }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 12px; }
+  .note { color: #888; font-size: 13px; text-align: center; max-width: 466px; }
+</style>
+</head>
+<body>
+
+<!-- ============ CLAUDE PAGE ============ -->
+<figure>
+  <h2>Claude · proposed</h2>
+  <div class="frame claude">
+    <!-- title -->
+    <div class="title">
+      <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48ZyBmaWxsPSIjRkY2QjM1Ij48cmVjdCB4PSI0NSIgeT0iNSIgd2lkdGg9IjEwIiBoZWlnaHQ9IjMwIi8+PHJlY3QgeD0iNDUiIHk9IjY1IiB3aWR0aD0iMTAiIGhlaWdodD0iMzAiLz48cmVjdCB4PSI1IiB5PSI0NSIgd2lkdGg9IjMwIiBoZWlnaHQ9IjEwIi8+PHJlY3QgeD0iNjUiIHk9IjQ1IiB3aWR0aD0iMzAiIGhlaWdodD0iMTAiLz48cmVjdCB4PSIxNSIgeT0iMTUiIHdpZHRoPSIxMCIgaGVpZ2h0PSIzMCIgdHJhbnNmb3JtPSJyb3RhdGUoNDUgMjAgMzApIi8+PHJlY3QgeD0iNzUiIHk9IjE1IiB3aWR0aD0iMTAiIGhlaWdodD0iMzAiIHRyYW5zZm9ybT0icm90YXRlKC00NSA4MCAzMCkiLz48cmVjdCB4PSIxNSIgeT0iNTUiIHdpZHRoPSIxMCIgaGVpZ2h0PSIzMCIgdHJhbnNmb3JtPSJyb3RhdGUoLTQ1IDIwIDcwKSIvPjxyZWN0IHg9Ijc1IiB5PSI1NSIgd2lkdGg9IjEwIiBoZWlnaHQ9IjMwIiB0cmFuc2Zvcm09InJvdGF0ZSg0NSA4MCA3MCkiLz48L2c+PC9zdmc+">
+      <span>Claude</span>
+    </div>
+
+    <!-- MODEL arc (orange, ~67% fill) -->
+    <div class="arc" style="left:70px; top:105px;">
+      <svg viewBox="0 0 92 92" width="92" height="92">
+        <circle class="bg" cx="46" cy="46" r="42"
+          stroke-dasharray="170 264" transform="rotate(195 46 46)"/>
+        <circle class="fg" cx="46" cy="46" r="42"
+          stroke="#FF6B35"
+          stroke-dasharray="113 264"
+          transform="rotate(195 46 46)"/>
+      </svg>
+    </div>
+    <div class="arc-text" style="left:70px; top:138px;">MODEL</div>
+    <div class="arc-text value" style="left:70px; top:157px;">opus-4.7</div>
+    <div class="arc-text sub" style="left:70px; top:182px;">claude</div>
+
+    <!-- pet -->
+    <div class="pet"></div>
+
+    <!-- STATUS arc (cyan, ~50% fill) -->
+    <div class="arc" style="left:306px; top:105px;">
+      <svg viewBox="0 0 92 92" width="92" height="92">
+        <circle class="bg" cx="46" cy="46" r="42"
+          stroke-dasharray="170 264" transform="rotate(230 46 46)"/>
+        <circle class="fg" cx="46" cy="46" r="42"
+          stroke="#88CCEE"
+          stroke-dasharray="85 264"
+          transform="rotate(230 46 46)"/>
+      </svg>
+    </div>
+    <div class="arc-text" style="left:306px; top:138px;">STATUS</div>
+    <div class="arc-text value" style="left:306px; top:157px; color:#88CCEE;">BUSY</div>
+    <div class="arc-text sub" style="left:306px; top:182px;">session</div>
+
+    <!-- Quota rows: new layout -->
+    <div class="qrow" style="top:222px;">
+      <span class="qlabel">5H</span>
+      <span class="qreset">reset 23:00</span>
+      <div class="qbar"><div class="fill" style="width:67%"></div></div>
+      <span class="qpct">67%</span>
+    </div>
+    <div class="qrow" style="top:262px;">
+      <span class="qlabel">7D</span>
+      <span class="qreset">reset 6/9 09:00</span>
+      <div class="qbar"><div class="fill" style="width:84%"></div></div>
+      <span class="qpct">84%</span>
+    </div>
+
+    <!-- todolist line -->
+    <div class="todolist" style="top:308px;">TodoList&nbsp;&nbsp;5 / 8</div>
+    <div class="dots" style="top:338px;">
+      <span style="background:#FF6B35"></span>
+      <span style="background:#FF6B35"></span>
+      <span style="background:#FF6B35"></span>
+      <span style="background:#FF6B35"></span>
+      <span style="background:#FF6B35"></span>
+      <span style="background:#88CCEE"></span>
+      <span style="background:#444"></span>
+      <span style="background:#444"></span>
+    </div>
+
+    <!-- summary -->
+    <div class="summary" style="top:378px;">Today $30.01&nbsp;&nbsp;117.0K Tokens&nbsp;&nbsp;12:34</div>
+
+    <!-- battery -->
+    <div class="battery">▰ 86%</div>
+  </div>
+  <div class="note">Claude · 新 quota row：大 5H 左 + bar 中 + 大 67% 右 + 小 reset 浮 bar 上方右对齐</div>
+</figure>
+
+<!-- ============ CODEX PAGE ============ -->
+<figure>
+  <h2>Codex · proposed</h2>
+  <div class="frame codex">
+    <div class="title">
+      <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIiBmaWxsPSIjMjVDN0ZGIj48Y2lyY2xlIGN4PSI1MCIgY3k9IjUwIiByPSIyMCIvPjxnIHN0cm9rZT0iIzI1QzdGRiIgc3Ryb2tlLXdpZHRoPSI4IiBmaWxsPSJub25lIj48ZWxsaXBzZSBjeD0iNTAiIGN5PSI1MCIgcng9IjQwIiByeT0iMTUiLz48ZWxsaXBzZSBjeD0iNTAiIGN5PSI1MCIgcng9IjQwIiByeT0iMTUiIHRyYW5zZm9ybT0icm90YXRlKDYwIDUwIDUwKSIvPjxlbGxpcHNlIGN4PSI1MCIgY3k9IjUwIiByeD0iNDAiIHJ5PSIxNSIgdHJhbnNmb3JtPSJyb3RhdGUoMTIwIDUwIDUwKSIvPjwvZz48L3N2Zz4=">
+      <span>Codex</span>
+    </div>
+
+    <!-- MODEL arc -->
+    <div class="arc" style="left:70px; top:105px;">
+      <svg viewBox="0 0 92 92" width="92" height="92">
+        <circle class="bg" cx="46" cy="46" r="42" stroke-dasharray="170 264" transform="rotate(195 46 46)"/>
+        <circle class="fg" cx="46" cy="46" r="42" stroke="#FF4A2D" stroke-dasharray="160 264" transform="rotate(195 46 46)"/>
+      </svg>
+    </div>
+    <div class="arc-text" style="left:70px; top:138px;">MODEL</div>
+    <div class="arc-text value" style="left:70px; top:157px;">gpt-5.5</div>
+    <div class="arc-text sub" style="left:70px; top:182px;">auto</div>
+
+    <div class="pet" style="background:#3d8aff;"></div>
+
+    <!-- EFFORT arc -->
+    <div class="arc" style="left:306px; top:105px;">
+      <svg viewBox="0 0 92 92" width="92" height="92">
+        <circle class="bg" cx="46" cy="46" r="42" stroke-dasharray="170 264" transform="rotate(230 46 46)"/>
+        <circle class="fg" cx="46" cy="46" r="42" stroke="#25C7FF" stroke-dasharray="160 264" transform="rotate(230 46 46)"/>
+      </svg>
+    </div>
+    <div class="arc-text" style="left:306px; top:138px;">EFFORT</div>
+    <div class="arc-text value" style="left:306px; top:157px; color:#25C7FF;">HIGH</div>
+    <div class="arc-text sub" style="left:306px; top:182px;">reasoning</div>
+
+    <!-- Quota -->
+    <div class="qrow" style="top:222px;">
+      <span class="qlabel">5H</span>
+      <span class="qreset">reset 15:39</span>
+      <div class="qbar"><div class="fill" style="width:96%"></div></div>
+      <span class="qpct">96%</span>
+    </div>
+    <div class="qrow alt" style="top:262px;">
+      <span class="qlabel">7D</span>
+      <span class="qreset">reset 6/11 10:39</span>
+      <div class="qbar"><div class="fill" style="width:99%"></div></div>
+      <span class="qpct">99%</span>
+    </div>
+
+    <!-- activity — header centered, DAY/WK on separate lines (Codex side has no other bottom content) -->
+    <div class="todolist" style="top:308px;">Activity</div>
+    <div class="summary" style="top:342px; font-size:16px;">DAY&nbsp;&nbsp;2 m</div>
+    <div class="summary" style="top:370px; font-size:16px;">WK&nbsp;&nbsp;14 m</div>
+
+    <div class="battery">▰ 86%</div>
+  </div>
+  <div class="note">Codex · 上半同 Claude；底部 Activity 改纯文字</div>
+</figure>
+
+</body>
+</html>

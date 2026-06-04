@@ -8,6 +8,11 @@ set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/../userdemo/components/lvgl"
 )
 
+# Stamp every build with a unix-timestamp version so esp_https_ota sees a
+# different `version` field in the firmware image header on every rebuild.
+string(TIMESTAMP BUILD_TS "%s" UTC)
+file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/version.txt "${BUILD_TS}")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(mic_test)
 # lv_conf.h lives in userdemo/components/lvgl/ (next to LVGL src) so LVGL

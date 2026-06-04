@@ -14,19 +14,35 @@ import datetime
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from typing import Any
 
 CODEX_APP_NAMES = {"Codex"}  # macOS frontmost name.
-USAGE_FILE = os.path.expanduser("~/.codex/.stopwatch_usage.json")
+USAGE_FILE   = os.path.expanduser("~/.codex/.stopwatch_usage.json")
 CODEX_CONFIG = os.path.expanduser("~/.codex/config.toml")
+CODEX_AUTH   = os.path.expanduser("~/.codex/auth.json")
+CODEX_LOGS   = os.path.expanduser("~/.codex/logs_2.sqlite")
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 POLL_INTERVAL_S = 5
-STATUS_CACHE_S = 120
+STATUS_CACHE_S  = 120
+QUOTA_CACHE_S   = 60   # don't hammer ChatGPT backend
+HTTP_TIMEOUT    = 8
+
+try:
+    import certifi
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    _SSL_CTX = ssl.create_default_context()
 
 _last_status_ts = 0.0
 _last_status: dict[str, Any] = {}
+_last_quota_ts = 0.0
+_last_quota: dict[str, Any] = {}
 
 # Daily/weekly Codex.app focus-time budgets so the device UI bars have a scale.
 DAILY_BUDGET_MIN  = 60 * 5    # 5 hours
@@ -62,9 +78,143 @@ def _read_codex_config() -> dict[str, Any]:
     return out
 
 
+def _read_codex_live_state() -> dict[str, Any]:
+    """Pull the *active* model + reasoning_effort from the most recent turn in
+    logs_2.sqlite. The Codex desktop app's reasoning-effort menu writes runtime
+    state here, NOT into config.toml — so config.toml only reflects what was
+    set when the app last edited the file (often months ago).
+    Each turn log line contains `model=X codex.turn.reasoning_effort=Y`."""
+    import sqlite3
+    out: dict[str, Any] = {}
+    try:
+        conn = sqlite3.connect(f"file:{CODEX_LOGS}?mode=ro", uri=True, timeout=1.0)
+        cur = conn.execute(
+            "SELECT feedback_log_body FROM logs "
+            "WHERE feedback_log_body LIKE '%codex.turn.reasoning_effort=%' "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            body = row[0]
+            m = re.search(r"codex\.turn\.reasoning_effort=(\w+)", body)
+            if m: out["effort"] = m.group(1).lower()
+            m = re.search(r"\bmodel=([\w.\-]+)", body)
+            if m: out["model"] = m.group(1)
+    except Exception:
+        pass
+    return out
+
+
 def _query_codex_status() -> dict[str, Any]:
-    """Back-compat wrapper. Real CLI-based query is gone; we read config.toml."""
-    return _read_codex_config()
+    """Live state from sqlite (authoritative) layered on top of config.toml."""
+    base = _read_codex_config()
+    live = _read_codex_live_state()
+    if live.get("model"):  base["model"]  = live["model"]
+    if live.get("effort"): base["effort"] = live["effort"]
+    base["raw_ok"] = "model" in base
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Codex 5h / weekly quota — hit chatgpt.com/backend-api/wham/usage with the
+# access token Codex desktop wrote to ~/.codex/auth.json. Approach borrowed
+# from alexjc-tech/cc-island.
+# ---------------------------------------------------------------------------
+def _parse_reset_at(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        s = str(value).replace("Z", "+00:00")
+        return int(datetime.datetime.fromisoformat(s).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def _http_get_json(url: str, headers: dict[str, str]) -> tuple[int, Any]:
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=_SSL_CTX) as r:
+            body = r.read()
+            try:
+                return r.status, json.loads(body)
+            except json.JSONDecodeError:
+                return r.status, None
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except Exception:
+            return e.code, None
+    except Exception as e:
+        return 0, {"_transport_error": str(e)}
+
+
+def _fetch_codex_quota_uncached() -> dict[str, Any]:
+    """Call wham/usage and shape into our state fields. Returns {} on failure."""
+    try:
+        with open(CODEX_AUTH) as f:
+            tokens = json.load(f).get("tokens") or {}
+        token = tokens.get("access_token")
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not token:
+        return {}
+
+    status, obj = _http_get_json(
+        CODEX_USAGE_URL,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if status != 200 or not isinstance(obj, dict):
+        return {}
+
+    rl = obj.get("rate_limit") or {}
+    out: dict[str, Any] = {"plan": obj.get("plan_type")}
+
+    def _shape(window: dict[str, Any]) -> tuple[int | None, str, str]:
+        used = window.get("used_percent")
+        if isinstance(used, (int, float)):
+            used = int(used)
+        else:
+            used = None
+        reset_epoch = _parse_reset_at(window.get("reset_at"))
+        reset_str = ""
+        abs_str = ""
+        if reset_epoch:
+            dt = datetime.datetime.fromtimestamp(reset_epoch)
+            now_dt = datetime.datetime.now()
+            same_day = dt.date() == now_dt.date()
+            secs = reset_epoch - int(time.time())
+            if secs > 0:
+                if secs >= 86400:    reset_str = f"in {secs // 86400}d"
+                elif secs >= 3600:   reset_str = f"in {secs // 3600}h {(secs % 3600) // 60}m"
+                else:                reset_str = f"in {secs // 60}m"
+            # Absolute time the mockup uses: HH:MM if same day, "M/D HH:MM" otherwise
+            abs_str = dt.strftime("%H:%M") if same_day else dt.strftime("%-m/%-d %H:%M")
+        return used, reset_str, abs_str
+
+    p5_used, p5_rel, p5_abs = _shape(rl.get("primary_window") or {})
+    pw_used, pw_rel, pw_abs = _shape(rl.get("secondary_window") or {})
+    out["five_hour_used_pct"] = p5_used
+    out["five_hour_reset"]    = p5_rel
+    out["five_hour_reset_abs"] = p5_abs
+    out["week_used_pct"]      = pw_used
+    out["week_reset"]         = pw_rel
+    out["week_reset_abs"]     = pw_abs
+    return out
+
+
+def _get_cached_codex_quota() -> dict[str, Any]:
+    global _last_quota_ts, _last_quota
+    now = time.time()
+    if _last_quota and now - _last_quota_ts < QUOTA_CACHE_S:
+        return _last_quota
+    fresh = _fetch_codex_quota_uncached()
+    if fresh:
+        _last_quota = fresh
+        _last_quota_ts = now
+    return _last_quota
 
 
 def _get_cached_codex_status() -> dict[str, Any]:
@@ -161,7 +311,10 @@ def get_state() -> dict[str, Any]:
     now = time.time()
     today_min = raw.get("days",  {}).get(_day_key(now),  0) // 60
     week_min  = raw.get("weeks", {}).get(_week_key(now), 0) // 60
-    status = _get_cached_codex_status()
+    status = _get_cached_codex_status()         # config.toml → model + effort
+    quota  = _get_cached_codex_quota()           # wham/usage  → real 5h / week %
+    p5_used = quota.get("five_hour_used_pct")
+    pw_used = quota.get("week_used_pct")
     return {
         "today_minutes":         today_min,
         "today_budget_minutes":  DAILY_BUDGET_MIN,
@@ -169,16 +322,19 @@ def get_state() -> dict[str, Any]:
         "week_minutes":          week_min,
         "week_budget_minutes":   WEEKLY_BUDGET_MIN,
         "week_pct":              min(100, week_min * 100 // max(1, WEEKLY_BUDGET_MIN)),
-        "five_hour_left_pct":     status.get("five_hour_left_pct"),
-        "five_hour_used_pct":     status.get("five_hour_used_pct"),
-        "five_hour_reset":        status.get("five_hour_reset", ""),
-        "codex_week_left_pct":    status.get("week_left_pct"),
-        "codex_week_used_pct":    status.get("week_used_pct"),
-        "codex_week_reset":       status.get("week_reset", ""),
-        "codex_model":            status.get("model", ""),
-        "codex_effort":           status.get("effort", ""),
-        "codex_status_ok":        bool(status.get("raw_ok")),
-        "codex_status_error":     status.get("error", ""),
+        "five_hour_left_pct":    (100 - p5_used) if isinstance(p5_used, int) else None,
+        "five_hour_used_pct":    p5_used,
+        "five_hour_reset":       quota.get("five_hour_reset", ""),
+        "five_hour_reset_abs":   quota.get("five_hour_reset_abs", ""),
+        "codex_week_left_pct":   (100 - pw_used) if isinstance(pw_used, int) else None,
+        "codex_week_used_pct":   pw_used,
+        "codex_week_reset":      quota.get("week_reset", ""),
+        "codex_week_reset_abs":  quota.get("week_reset_abs", ""),
+        "codex_model":           status.get("model", ""),
+        "codex_effort":          status.get("effort", ""),
+        "codex_status_ok":       bool(status.get("raw_ok")),
+        "codex_status_error":    status.get("error", ""),
+        "codex_plan":            quota.get("plan", ""),
         "last_seen_ts":          raw.get("last_seen_ts"),
         "last_front":            raw.get("last_front"),
     }

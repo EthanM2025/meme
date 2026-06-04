@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Meme — Dashboard view (up-swipe from main)</title>
+<style>
+  body {
+    font-family: -apple-system, "Helvetica Neue", "PingFang SC", sans-serif;
+    background: #1a1a1a;
+    color: #ccc;
+    margin: 0;
+    padding: 24px;
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .frame {
+    width: 466px;
+    height: 466px;
+    background: #000;
+    border-radius: 50%;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 0 0 6px #222, 0 0 40px rgba(0,0,0,.8);
+  }
+
+  /* halves — no divider, just whitespace between */
+  .half { position: absolute; left: 0; right: 0; }
+  .half.top    { top: 0;   height: 220px; }
+  .half.bottom { top: 220px; height: 220px; }
+
+  /* brand row: small logo + name */
+  .brand {
+    position: absolute;
+    top: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .brand img { width: 22px; height: 22px; }
+  .brand span { font-size: 18px; font-weight: 600; line-height: 1; }
+  .claude .brand span { color: #FF6B35; }
+  .codex  .brand span { color: #25C7FF; }
+
+  /* big % block on the LEFT (centered around x≈125) */
+  .big {
+    position: absolute;
+    top: 88px;
+    left: 55px;
+    width: 140px;
+    text-align: center;
+  }
+  .big .num {
+    font-size: 64px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -2px;
+  }
+  .big .num .pct { font-size: 28px; font-weight: 500; vertical-align: super; margin-left: 4px; }
+  .claude .big .num { color: #FF6B35; }
+  .codex  .big .num { color: #25C7FF; }
+  .big .sub {
+    margin-top: 10px;
+    font-size: 14px;
+    color: #999;
+    letter-spacing: 4px;
+  }
+
+  /* compact two rows on the RIGHT (centered around x≈340) */
+  .compact {
+    position: absolute;
+    top: 92px;
+    left: 251px;
+    width: 180px;
+  }
+  .compact .row {
+    position: relative;
+    height: 28px;
+    margin-bottom: 22px;
+  }
+  .compact .row .lbl {
+    position: absolute;
+    left: 0; top: 0;
+    font-size: 13px;
+    color: #ccc;
+    font-weight: 500;
+  }
+  .compact .row .reset {
+    position: absolute;
+    right: 0; top: 0;
+    font-size: 12px;
+    color: #777;
+  }
+  .compact .row .bar {
+    position: absolute;
+    left: 0; right: 0;
+    bottom: 0;
+    height: 4px;
+    background: #2a2a3a;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .compact .row .bar .fill {
+    height: 100%;
+    border-radius: 2px;
+  }
+  .claude .compact .row .bar .fill { background: #FF6B35; }
+  .codex  .compact .row .bar .fill { background: #25C7FF; }
+
+  /* Claude row 2 = cost text only (no bar) */
+  .compact .row.text-only .val {
+    position: absolute;
+    right: 0; top: 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: #FF6B35;
+  }
+  .compact .row.text-only .lbl-soft {
+    position: absolute;
+    left: 0; top: 4px;
+    font-size: 13px;
+    color: #888;
+  }
+
+  /* bottom clock */
+  .clock {
+    position: absolute;
+    left: 0; right: 0;
+    bottom: 16px;
+    text-align: center;
+    color: #888;
+    font-size: 16px;
+    letter-spacing: 1px;
+  }
+
+  h2 { color: #eee; margin: 0; text-align: center; font-size: 16px; font-weight: 500; }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 12px; }
+  .note { color: #888; font-size: 13px; text-align: center; max-width: 466px; }
+</style>
+</head>
+<body>
+
+<figure>
+  <h2>Dashboard · 上滑从主页进入</h2>
+  <div class="frame">
+    <!-- ===== TOP HALF: CLAUDE ===== -->
+    <div class="half top claude">
+      <div class="brand">
+        <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48ZyBmaWxsPSIjRkY2QjM1Ij48cmVjdCB4PSI0NSIgeT0iNSIgd2lkdGg9IjEwIiBoZWlnaHQ9IjMwIi8+PHJlY3QgeD0iNDUiIHk9IjY1IiB3aWR0aD0iMTAiIGhlaWdodD0iMzAiLz48cmVjdCB4PSI1IiB5PSI0NSIgd2lkdGg9IjMwIiBoZWlnaHQ9IjEwIi8+PHJlY3QgeD0iNjUiIHk9IjQ1IiB3aWR0aD0iMzAiIGhlaWdodD0iMTAiLz48cmVjdCB4PSIxNSIgeT0iMTUiIHdpZHRoPSIxMCIgaGVpZ2h0PSIzMCIgdHJhbnNmb3JtPSJyb3RhdGUoNDUgMjAgMzApIi8+PHJlY3QgeD0iNzUiIHk9IjE1IiB3aWR0aD0iMTAiIGhlaWdodD0iMzAiIHRyYW5zZm9ybT0icm90YXRlKC00NSA4MCAzMCkiLz48cmVjdCB4PSIxNSIgeT0iNTUiIHdpZHRoPSIxMCIgaGVpZ2h0PSIzMCIgdHJhbnNmb3JtPSJyb3RhdGUoLTQ1IDIwIDcwKSIvPjxyZWN0IHg9Ijc1IiB5PSI1NSIgd2lkdGg9IjEwIiBoZWlnaHQ9IjMwIiB0cmFuc2Zvcm09InJvdGF0ZSg0NSA4MCA3MCkiLz48L2c+PC9zdmc+">
+        <span>Claude</span>
+      </div>
+
+      <div class="big">
+        <div class="num">67<span class="pct">%</span></div>
+        <div class="sub">剩余</div>
+      </div>
+
+      <div class="compact">
+        <div class="row">
+          <div class="lbl">Token</div>
+          <div class="reset">重置 00:00</div>
+          <div class="bar"><div class="fill" style="width: 33%"></div></div>
+        </div>
+        <div class="row text-only">
+          <div class="lbl-soft">Today</div>
+          <div class="val">$3.50</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== BOTTOM HALF: CODEX ===== -->
+    <div class="half bottom codex">
+      <div class="brand">
+        <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIiBmaWxsPSIjMjVDN0ZGIj48Y2lyY2xlIGN4PSI1MCIgY3k9IjUwIiByPSIyMCIvPjxnIHN0cm9rZT0iIzI1QzdGRiIgc3Ryb2tlLXdpZHRoPSI4IiBmaWxsPSJub25lIj48ZWxsaXBzZSBjeD0iNTAiIGN5PSI1MCIgcng9IjQwIiByeT0iMTUiLz48ZWxsaXBzZSBjeD0iNTAiIGN5PSI1MCIgcng9IjQwIiByeT0iMTUiIHRyYW5zZm9ybT0icm90YXRlKDYwIDUwIDUwKSIvPjxlbGxpcHNlIGN4PSI1MCIgY3k9IjUwIiByeD0iNDAiIHJ5PSIxNSIgdHJhbnNmb3JtPSJyb3RhdGUoMTIwIDUwIDUwKSIvPjwvZz48L3N2Zz4=">
+        <span>Codex</span>
+      </div>
+
+      <div class="big">
+        <div class="num">95<span class="pct">%</span></div>
+        <div class="sub">剩余</div>
+      </div>
+
+      <div class="compact">
+        <div class="row">
+          <div class="lbl">5h</div>
+          <div class="reset">重置 01:54</div>
+          <div class="bar"><div class="fill" style="width: 5%"></div></div>
+        </div>
+        <div class="row">
+          <div class="lbl">7d</div>
+          <div class="reset">6/8 11:40</div>
+          <div class="bar"><div class="fill" style="width: 42%"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- bottom-of-screen clock -->
+    <div class="clock">22:33</div>
+  </div>
+  <div class="note">
+    取消中间分割线；左大 % + 剩余 (中心约 x=125)，右两条紧凑 (中心约 x=340)，整体在屏幕中心两侧对称
+  </div>
+</figure>
+
+</body>
+</html>
