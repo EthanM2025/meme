@@ -36,6 +36,19 @@ def press_enter() -> None:
     )
 
 
+def clear_input() -> None:
+    """Wipe the focused input field: Cmd+A then Delete.
+    Triggered by a double-press on the device's right button."""
+    subprocess.run(
+        ["osascript", "-e",
+         'tell application "System Events"\n'
+         '  keystroke "a" using command down\n'
+         '  key code 51\n'   # 51 = delete/backspace
+         'end tell'],
+        check=False,
+    )
+
+
 def get_active_app() -> str:
     """Returns the name of the frontmost app, for logging."""
     try:

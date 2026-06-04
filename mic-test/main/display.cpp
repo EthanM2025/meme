@@ -25,6 +25,8 @@
 #include "claude_pet_assets.h"
 #include "i2c_bus.h"
 #include "kitty_pet_assets.h"
+#include "diana_pet_assets.h"
+#include "nier_pet_assets.h"
 #include "esp_random.h"
 
 // 48x48 RGB565 brand logos from alexjc-tech/cc-island.
@@ -133,14 +135,17 @@ static std::unique_ptr<Cst820> s_touch;
 static volatile bool s_touch_activity = false;
 
 // Screens form a "cross": Claude ↔ Codex horizontally.
-//   swipe UP   from a main → Dashboard (data summary)
-//   swipe DOWN from a main → Pet (just a kitten animation, no UI chrome)
-//   on Dashboard / Pet, the inverse swipe returns to whichever main we came from.
+//   swipe UP   from a main  → Dashboard (data summary)
+//   swipe DOWN from a main  → Pet (animation-only, no UI chrome)
+//   on Dashboard / any Pet, swipe in the inverse direction → last main
+//   left/right on a pet screen → cycle to next/prev pet (linear, edge-bounded)
+static constexpr int NUM_PETS = 3;
 static lv_obj_t* s_scr_claude    = nullptr;
 static lv_obj_t* s_scr_codex     = nullptr;
 static lv_obj_t* s_scr_dashboard = nullptr;
-static lv_obj_t* s_scr_pet       = nullptr;
-static lv_obj_t* s_last_main     = nullptr;   // tracks claude/codex; updated when we leave a main
+static lv_obj_t* s_scr_pets[NUM_PETS] = {nullptr};
+static int s_pet_active          = 0;          // index into s_scr_pets[]
+static lv_obj_t* s_last_main     = nullptr;   // claude or codex; updated when we leave a main
 // Setup screen — only shown while SoftAP provisioning is active.
 static lv_obj_t* s_scr_setup  = nullptr;
 
@@ -211,6 +216,62 @@ static uint8_t s_codex_pet_frame = 0;
 static const lv_image_dsc_t* const* s_codex_pet_frames = codex_pet_idle_frames;
 static const uint32_t* s_codex_pet_durations = codex_pet_idle_durations_ms;
 static uint8_t s_codex_pet_frame_count = CODEX_PET_IDLE_FRAME_COUNT;
+
+// Per-pet animation lookup table — kitty / diana / nier share identical
+// frame counts and durations (see /tmp/gen_pet.py), so all the state machine
+// needs from a given pet is which frame array to pull from.
+struct PetSpec {
+    const lv_image_dsc_t* const* idle_frames;
+    const uint32_t*              idle_durs;
+    const lv_image_dsc_t* const* wave_frames;
+    const uint32_t*              wave_durs;
+    const lv_image_dsc_t* const* fail_frames;
+    const uint32_t*              fail_durs;
+    const lv_image_dsc_t* const* wait_frames;
+    const uint32_t*              wait_durs;
+    const lv_image_dsc_t* const* review_frames;
+    const uint32_t*              review_durs;
+    uint8_t idle_count, wave_count, fail_count, wait_count, review_count;
+    uint16_t frame_w, frame_h;   // for screen-centering math
+};
+static const PetSpec PETS[NUM_PETS] = {
+    {
+        kitty_pet_idle_frames,   kitty_pet_idle_durations_ms,
+        kitty_pet_wave_frames,   kitty_pet_wave_durations_ms,
+        kitty_pet_fail_frames,   kitty_pet_fail_durations_ms,
+        kitty_pet_wait_frames,   kitty_pet_wait_durations_ms,
+        kitty_pet_review_frames, kitty_pet_review_durations_ms,
+        KITTY_PET_IDLE_FRAME_COUNT, KITTY_PET_WAVE_FRAME_COUNT,
+        KITTY_PET_FAIL_FRAME_COUNT, KITTY_PET_WAIT_FRAME_COUNT,
+        KITTY_PET_REVIEW_FRAME_COUNT,
+        KITTY_PET_FRAME_W, KITTY_PET_FRAME_H,
+    },
+    {
+        diana_pet_idle_frames,   diana_pet_idle_durations_ms,
+        diana_pet_wave_frames,   diana_pet_wave_durations_ms,
+        diana_pet_fail_frames,   diana_pet_fail_durations_ms,
+        diana_pet_wait_frames,   diana_pet_wait_durations_ms,
+        diana_pet_review_frames, diana_pet_review_durations_ms,
+        DIANA_PET_IDLE_FRAME_COUNT, DIANA_PET_WAVE_FRAME_COUNT,
+        DIANA_PET_FAIL_FRAME_COUNT, DIANA_PET_WAIT_FRAME_COUNT,
+        DIANA_PET_REVIEW_FRAME_COUNT,
+        DIANA_PET_FRAME_W, DIANA_PET_FRAME_H,
+    },
+    {
+        nier_pet_idle_frames,    nier_pet_idle_durations_ms,
+        nier_pet_wave_frames,    nier_pet_wave_durations_ms,
+        nier_pet_fail_frames,    nier_pet_fail_durations_ms,
+        nier_pet_wait_frames,    nier_pet_wait_durations_ms,
+        nier_pet_review_frames,  nier_pet_review_durations_ms,
+        NIER_PET_IDLE_FRAME_COUNT, NIER_PET_WAVE_FRAME_COUNT,
+        NIER_PET_FAIL_FRAME_COUNT, NIER_PET_WAIT_FRAME_COUNT,
+        NIER_PET_REVIEW_FRAME_COUNT,
+        NIER_PET_FRAME_W, NIER_PET_FRAME_H,
+    },
+};
+
+// One image widget per pet screen — only the active screen's widget is updated.
+static lv_obj_t* s_pet_imgs[NUM_PETS] = {nullptr};
 
 // Dashboard widgets — Claude top half + Codex bottom half + bottom clock.
 static lv_obj_t* s_dash_claude_big       = nullptr;   // "67%" big
@@ -791,128 +852,143 @@ static lv_obj_t* mk_dash_left_block(lv_obj_t* parent,
     return big;
 }
 
-// ================== Pet screen ==================
-// Single fullscreen image, cycles through idle/wait/fail/review at random when
-// not recording; switches to "wave" while the user holds the record button.
+// ================== Pet screens (3 of them, swipe-able) ==================
+// Each pet has its own screen + image widget. A single timer drives whichever
+// pet's screen is currently active. The state machine (idle ~ random expression
+// ~ idle) is pet-agnostic — frame data is looked up via PETS[s_pet_active].
 
-enum KittyState { K_IDLE = 0, K_WAVE, K_FAIL, K_WAIT, K_REVIEW };
+enum PetState { P_IDLE = 0, P_WAVE, P_FAIL, P_WAIT, P_REVIEW };
 
-static lv_obj_t* s_kitty_img             = nullptr;
-static lv_timer_t* s_kitty_timer         = nullptr;
-static KittyState s_kitty_state          = K_IDLE;
-static uint8_t s_kitty_frame             = 0;
-// "Most of the time idle, with the occasional expression mixed in."
-// We sit in K_IDLE for N cycles, then play ONE cycle of a random expression
-// (wait/fail/review), then return to K_IDLE.
-static uint8_t s_kitty_idle_cycles_left  = 0;
-static bool s_kitty_recording            = false;
+static lv_timer_t* s_pet_timer        = nullptr;
+static PetState s_pet_state           = P_IDLE;
+static uint8_t s_pet_frame            = 0;
+// Most of the time we sit in P_IDLE; every N idle cycles a single expression
+// (wait/fail/review) is mixed in. Carries across pet swaps so behaviour stays
+// consistent if you flip between pets quickly.
+static uint8_t s_pet_idle_cycles_left = 0;
+static bool s_pet_recording           = false;
 
-static const lv_image_dsc_t* const* kitty_anim_frames(KittyState s) {
+static const lv_image_dsc_t* const* pet_anim_frames(const PetSpec& p, PetState s) {
     switch (s) {
-        case K_WAVE:   return kitty_pet_wave_frames;
-        case K_FAIL:   return kitty_pet_fail_frames;
-        case K_WAIT:   return kitty_pet_wait_frames;
-        case K_REVIEW: return kitty_pet_review_frames;
-        case K_IDLE:
-        default:       return kitty_pet_idle_frames;
+        case P_WAVE:   return p.wave_frames;
+        case P_FAIL:   return p.fail_frames;
+        case P_WAIT:   return p.wait_frames;
+        case P_REVIEW: return p.review_frames;
+        case P_IDLE:
+        default:       return p.idle_frames;
     }
 }
-static const uint32_t* kitty_anim_durs(KittyState s) {
+static const uint32_t* pet_anim_durs(const PetSpec& p, PetState s) {
     switch (s) {
-        case K_WAVE:   return kitty_pet_wave_durations_ms;
-        case K_FAIL:   return kitty_pet_fail_durations_ms;
-        case K_WAIT:   return kitty_pet_wait_durations_ms;
-        case K_REVIEW: return kitty_pet_review_durations_ms;
-        case K_IDLE:
-        default:       return kitty_pet_idle_durations_ms;
+        case P_WAVE:   return p.wave_durs;
+        case P_FAIL:   return p.fail_durs;
+        case P_WAIT:   return p.wait_durs;
+        case P_REVIEW: return p.review_durs;
+        case P_IDLE:
+        default:       return p.idle_durs;
     }
 }
-static int kitty_anim_count(KittyState s) {
-    // Frame counts differ per row in petdex sprites (the original wave row has
-    // only 4 non-empty frames; treating all rows as 6 caused blank-frame flashes).
+static int pet_anim_count(const PetSpec& p, PetState s) {
     switch (s) {
-        case K_WAVE:   return KITTY_PET_WAVE_FRAME_COUNT;
-        case K_FAIL:   return KITTY_PET_FAIL_FRAME_COUNT;
-        case K_WAIT:   return KITTY_PET_WAIT_FRAME_COUNT;
-        case K_REVIEW: return KITTY_PET_REVIEW_FRAME_COUNT;
-        case K_IDLE:
-        default:       return KITTY_PET_IDLE_FRAME_COUNT;
+        case P_WAVE:   return p.wave_count;
+        case P_FAIL:   return p.fail_count;
+        case P_WAIT:   return p.wait_count;
+        case P_REVIEW: return p.review_count;
+        case P_IDLE:
+        default:       return p.idle_count;
     }
 }
 
-static KittyState kitty_random_expression(void) {
-    // Expressions sprinkled in between long idle stretches.
-    static const KittyState pool[] = { K_WAIT, K_FAIL, K_REVIEW };
+static PetState pet_random_expression(void) {
+    static const PetState pool[] = { P_WAIT, P_FAIL, P_REVIEW };
     return pool[esp_random() % 3];
 }
+// 2–5 idle cycles between expressions, ~7–17s with current durations.
+static uint8_t pet_pick_idle_run(void) { return 2 + (esp_random() % 4); }
 
-// Number of idle cycles to play before slipping in one expression.
-// Idle is ~6 frames × ~280ms ≈ 1.7s, so 4–8 cycles ≈ 7–14s of "just idle".
-static uint8_t kitty_pick_idle_run(void) { return 4 + (esp_random() % 5); }
-
-static void kitty_timer_cb(lv_timer_t* /*t*/) {
-    if (!s_kitty_img) return;
-    s_kitty_frame++;
-    if (s_kitty_frame >= kitty_anim_count(s_kitty_state)) {
-        s_kitty_frame = 0;
-        if (s_kitty_recording) {
-            s_kitty_state = K_WAVE;
-        } else if (s_kitty_state == K_IDLE) {
-            if (s_kitty_idle_cycles_left > 1) {
-                s_kitty_idle_cycles_left--;     // stay calm — replay idle
+static void pet_timer_cb(lv_timer_t* /*t*/) {
+    const int i = s_pet_active;
+    if (i < 0 || i >= NUM_PETS || !s_pet_imgs[i]) return;
+    const PetSpec& spec = PETS[i];
+    s_pet_frame++;
+    if (s_pet_frame >= pet_anim_count(spec, s_pet_state)) {
+        s_pet_frame = 0;
+        if (s_pet_recording) {
+            s_pet_state = P_WAVE;
+        } else if (s_pet_state == P_IDLE) {
+            if (s_pet_idle_cycles_left > 1) {
+                s_pet_idle_cycles_left--;
             } else {
-                s_kitty_idle_cycles_left = 0;
-                s_kitty_state = kitty_random_expression();   // pop one expression
+                s_pet_idle_cycles_left = 0;
+                s_pet_state = pet_random_expression();
             }
         } else {
-            // The expression cycle just finished — fall back to idle, then sit there a while.
-            s_kitty_state = K_IDLE;
-            s_kitty_idle_cycles_left = kitty_pick_idle_run();
+            // Expression cycle done — back to idle for a while.
+            s_pet_state = P_IDLE;
+            s_pet_idle_cycles_left = pet_pick_idle_run();
         }
     }
-    lv_image_set_src(s_kitty_img, kitty_anim_frames(s_kitty_state)[s_kitty_frame]);
-    lv_timer_set_period(s_kitty_timer, kitty_anim_durs(s_kitty_state)[s_kitty_frame]);
+    lv_image_set_src(s_pet_imgs[i], pet_anim_frames(spec, s_pet_state)[s_pet_frame]);
+    lv_timer_set_period(s_pet_timer, pet_anim_durs(spec, s_pet_state)[s_pet_frame]);
 }
 
-static void kitty_set_recording_locked(bool recording) {
-    s_kitty_recording = recording;
-    if (recording) {
-        // Snap to wave immediately so the user gets feedback on touch-down.
-        s_kitty_state = K_WAVE;
-        s_kitty_frame = 0;
-        if (s_kitty_img) lv_image_set_src(s_kitty_img, kitty_pet_wave_frames[0]);
-        if (s_kitty_timer) lv_timer_set_period(s_kitty_timer,
-                                               kitty_pet_wave_durations_ms[0]);
-    } else {
-        // After release, the running wave cycle finishes and the timer_cb's
-        // "expression done → return to idle" branch takes over naturally.
-        s_kitty_idle_cycles_left = kitty_pick_idle_run();
+static void pet_set_recording_locked(bool recording) {
+    s_pet_recording = recording;
+    const int i = s_pet_active;
+    if (recording && i >= 0 && i < NUM_PETS) {
+        s_pet_state = P_WAVE;
+        s_pet_frame = 0;
+        if (s_pet_imgs[i]) lv_image_set_src(s_pet_imgs[i], PETS[i].wave_frames[0]);
+        if (s_pet_timer)   lv_timer_set_period(s_pet_timer, PETS[i].wave_durs[0]);
+    } else if (!recording) {
+        // Wave finishes naturally; timer_cb's "expression done" branch returns to idle.
+        s_pet_idle_cycles_left = pet_pick_idle_run();
     }
 }
 
-static void build_pet_screen(void) {
+// When the user swipes between pets, snap the new pet's image to a fresh idle
+// frame so it doesn't start mid-expression. The timer keeps running and will
+// pick up the new pet on its next tick.
+static void pet_switch_to_locked(int new_idx) {
+    if (new_idx < 0 || new_idx >= NUM_PETS) return;
+    s_pet_active = new_idx;
+    s_pet_state = P_IDLE;
+    s_pet_frame = 0;
+    s_pet_idle_cycles_left = pet_pick_idle_run();
+    if (s_pet_imgs[new_idx]) lv_image_set_src(s_pet_imgs[new_idx],
+                                              PETS[new_idx].idle_frames[0]);
+    if (s_pet_timer) lv_timer_set_period(s_pet_timer, PETS[new_idx].idle_durs[0]);
+}
+
+static void build_one_pet_screen(int idx) {
     lv_obj_t* scr = lv_obj_create(NULL);
-    s_scr_pet = scr;
+    s_scr_pets[idx] = scr;
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_kitty_img = lv_image_create(scr);
-    lv_image_set_src(s_kitty_img, kitty_pet_idle_frames[0]);
-    // Source 96×104, display at scale 2× → 192×208 visible (≈41% × 45% of the round
-    // display). Cuts the per-frame render cost ~36% vs 2.5× so playback stays smooth.
-    lv_image_set_scale(s_kitty_img, 512);
-    lv_image_set_antialias(s_kitty_img, false);
-    lv_obj_set_pos(s_kitty_img,
-                   (468 - KITTY_PET_FRAME_W) / 2,
-                   (466 - KITTY_PET_FRAME_H) / 2);
-    lv_obj_clear_flag(s_kitty_img, LV_OBJ_FLAG_CLICKABLE);
+    const PetSpec& spec = PETS[idx];
+    lv_obj_t* img = lv_image_create(scr);
+    s_pet_imgs[idx] = img;
+    lv_image_set_src(img, spec.idle_frames[0]);
+    // Source frames are 96×104; display at scale 2× for crisp, jitter-free
+    // playback on the S3. AA off (nearest-neighbor) — bilinear+alpha was too
+    // heavy and caused drops.
+    lv_image_set_scale(img, 512);
+    lv_image_set_antialias(img, false);
+    lv_obj_set_pos(img, (468 - spec.frame_w) / 2, (466 - spec.frame_h) / 2);
+    lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+}
 
-    s_kitty_state = K_IDLE;
-    s_kitty_idle_cycles_left = kitty_pick_idle_run();
+static void build_pet_screens(void) {
+    for (int i = 0; i < NUM_PETS; ++i) build_one_pet_screen(i);
 
-    if (!s_kitty_timer) {
-        s_kitty_timer = lv_timer_create(kitty_timer_cb,
-                                        kitty_pet_idle_durations_ms[0], nullptr);
+    s_pet_active = 0;
+    s_pet_state = P_IDLE;
+    s_pet_idle_cycles_left = pet_pick_idle_run();
+
+    if (!s_pet_timer) {
+        s_pet_timer = lv_timer_create(pet_timer_cb,
+                                      PETS[0].idle_durs[0], nullptr);
     }
 }
 
@@ -1020,7 +1096,7 @@ static void build_boot_screen(void) {
     build_claude_screen();
     build_codex_screen();
     build_dashboard_screen();
-    build_pet_screen();
+    build_pet_screens();
     build_setup_screen();
     s_last_main = s_scr_claude;
     lv_screen_load(s_scr_claude);
@@ -1051,7 +1127,7 @@ void ui_set_recording(bool on) {
         }
         set_codex_pet_recording(on);
         set_claude_pet_recording(on);
-        kitty_set_recording_locked(on);
+        pet_set_recording_locked(on);
         lvgl_unlock();
     }
 }
@@ -1429,27 +1505,43 @@ static void touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
+// Returns the index in s_scr_pets[] of the given screen, or -1 if not a pet screen.
+static int pet_screen_index(lv_obj_t* scr) {
+    for (int i = 0; i < NUM_PETS; ++i) if (scr == s_scr_pets[i]) return i;
+    return -1;
+}
+
 static void gesture_cb(lv_event_t* e) {
     (void)e;
     lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
     lv_obj_t* cur = lv_screen_active();
+    const int pet_idx = pet_screen_index(cur);
+    const bool on_main = (cur == s_scr_claude || cur == s_scr_codex);
+
     if (dir == LV_DIR_LEFT && cur == s_scr_claude && s_scr_codex) {
         lv_screen_load_anim(s_scr_codex, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
     } else if (dir == LV_DIR_RIGHT && cur == s_scr_codex && s_scr_claude) {
         lv_screen_load_anim(s_scr_claude, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
-    } else if (dir == LV_DIR_TOP && (cur == s_scr_claude || cur == s_scr_codex)
-               && s_scr_dashboard) {
+    } else if (dir == LV_DIR_TOP && on_main && s_scr_dashboard) {
         s_last_main = cur;
         lv_screen_load_anim(s_scr_dashboard, LV_SCR_LOAD_ANIM_MOVE_TOP, 250, 0, false);
     } else if (dir == LV_DIR_BOTTOM && cur == s_scr_dashboard && s_last_main) {
         lv_screen_load_anim(s_last_main, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 250, 0, false);
-    } else if (dir == LV_DIR_BOTTOM && (cur == s_scr_claude || cur == s_scr_codex)
-               && s_scr_pet) {
-        // Down-swipe from a main → pet screen (the "above" cell of the nav cross).
+    } else if (dir == LV_DIR_BOTTOM && on_main && s_scr_pets[s_pet_active]) {
+        // Down-swipe from a main → currently-active pet (preserves last visited pet).
         s_last_main = cur;
-        lv_screen_load_anim(s_scr_pet, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 250, 0, false);
-    } else if (dir == LV_DIR_TOP && cur == s_scr_pet && s_last_main) {
+        lv_screen_load_anim(s_scr_pets[s_pet_active],
+                            LV_SCR_LOAD_ANIM_MOVE_BOTTOM, 250, 0, false);
+    } else if (dir == LV_DIR_TOP && pet_idx >= 0 && s_last_main) {
         lv_screen_load_anim(s_last_main, LV_SCR_LOAD_ANIM_MOVE_TOP, 250, 0, false);
+    } else if (dir == LV_DIR_LEFT && pet_idx >= 0 && pet_idx < NUM_PETS - 1) {
+        pet_switch_to_locked(pet_idx + 1);
+        lv_screen_load_anim(s_scr_pets[pet_idx + 1],
+                            LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    } else if (dir == LV_DIR_RIGHT && pet_idx > 0) {
+        pet_switch_to_locked(pet_idx - 1);
+        lv_screen_load_anim(s_scr_pets[pet_idx - 1],
+                            LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
     }
 }
 
@@ -1474,7 +1566,9 @@ void touch_init(i2c_bus_handle_t bus) {
         if (s_scr_claude)    lv_obj_add_event_cb(s_scr_claude,    gesture_cb, LV_EVENT_GESTURE, nullptr);
         if (s_scr_codex)     lv_obj_add_event_cb(s_scr_codex,     gesture_cb, LV_EVENT_GESTURE, nullptr);
         if (s_scr_dashboard) lv_obj_add_event_cb(s_scr_dashboard, gesture_cb, LV_EVENT_GESTURE, nullptr);
-        if (s_scr_pet)       lv_obj_add_event_cb(s_scr_pet,       gesture_cb, LV_EVENT_GESTURE, nullptr);
+        for (int i = 0; i < NUM_PETS; ++i) {
+            if (s_scr_pets[i]) lv_obj_add_event_cb(s_scr_pets[i], gesture_cb, LV_EVENT_GESTURE, nullptr);
+        }
         lvgl_unlock();
     }
 }

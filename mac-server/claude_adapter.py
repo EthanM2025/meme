@@ -101,6 +101,11 @@ def parse_session(jsonl_path: str) -> dict:
         "busy": False,            # True if the latest assistant turn used a tool (i.e. work in progress)
     }
     last_assistant_tool_use = False
+    # Native "task complete" signal from Claude Code: the last assistant
+    # message whose stop_reason == "end_turn" (i.e. Claude finished talking
+    # rather than pausing for a tool call). We track its timestamp so the
+    # server can detect *new* completions across polls.
+    last_end_turn_ts: str | None = None
     today_midnight = datetime.datetime.now().replace(
         hour=0, minute=0, second=0, microsecond=0).timestamp()
 
@@ -153,6 +158,9 @@ def parse_session(jsonl_path: str) -> dict:
                 last_assistant_tool_use = any(
                     isinstance(b, dict) and b.get("type") == "tool_use" for b in content
                 )
+                # Native task-complete signal — record timestamp of every end_turn.
+                if m.get("stop_reason") == "end_turn" and ts:
+                    last_end_turn_ts = ts
 
             elif d.get("type") == "user":
                 # If a user message comes in after an assistant tool_use, it's likely a tool_result.
@@ -175,6 +183,7 @@ def parse_session(jsonl_path: str) -> dict:
                 # tool_use input on the assistant side.
 
     state["busy"] = last_assistant_tool_use
+    state["last_end_turn_ts"] = last_end_turn_ts
 
     # Second pass — pluck the latest TodoWrite tool_use's input.todos.
     # We do a backwards scan from EOF.

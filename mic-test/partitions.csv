@@ -1,10 +1,12 @@
-# OTA-capable layout: two 3.5MB app slots + 8MB storage.
-# After this is flashed once via USB, future updates can come over the air
-# (esp_https_ota writes the inactive slot, otadata flips, esp_restart).
+# OTA-capable layout: two 5MB app slots + 6MB storage.
+# (Grew from 3.5MB / 9.4MB to fit multiple pet sprite animations; storage
+# partition is never mounted by our code, so shrinking it is harmless.)
+# NVS / phy_init / otadata offsets are unchanged → WiFi creds and hostname
+# survive the re-flash that this partition change requires.
 # Name,   Type, SubType, Offset,    Size,     Flags
 nvs,      data, nvs,     0x9000,    0x6000,
 phy_init, data, phy,     0xf000,    0x1000,
 otadata,  data, ota,     0x11000,   0x2000,
-ota_0,    app,  ota_0,   0x20000,   0x350000,
-ota_1,    app,  ota_1,   0x370000,  0x350000,
-storage,  data, spiffs,  0x6c0000,  0x940000,
+ota_0,    app,  ota_0,   0x20000,   0x500000,
+ota_1,    app,  ota_1,   0x520000,  0x500000,
+storage,  data, spiffs,  0xa20000,  0x5e0000,

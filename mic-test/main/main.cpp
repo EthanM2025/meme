@@ -7,8 +7,12 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "chime.h"
+
+extern "C" bool is_recording_getter(void);
 #include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "i2c_bus.h"
 #include "M5PM1.h"
 #include "M5IOE1.h"
@@ -49,6 +53,8 @@ static constexpr int64_t IDLE_SLEEP_US = 120LL * 1000 * 1000;
 static constexpr m5ioe1_pin_t IOE_AU_EN  = M5IOE1_PIN_3;   // audio power enable
 static constexpr m5ioe1_pin_t IOE_L3B_EN = M5IOE1_PIN_8;   // upstream rail confirm
 static constexpr m5ioe1_pin_t IOE_TP_RST = M5IOE1_PIN_4;   // touch reset (active low)
+static constexpr m5ioe1_pin_t IOE_SPK_PA = M5IOE1_PIN_10;  // speaker PA enable (per UserDemo hal_ioe)
+static constexpr gpio_num_t   SPK_PA_PIN = GPIO_NUM_14;    // direct-GPIO half of the PA enable
 
 static M5PM1  pmic;
 static M5IOE1 ioe;
@@ -95,8 +101,14 @@ static void init_ioe() {
     ioe.pinMode(IOE_AU_EN,  OUTPUT);
     ioe.pinMode(IOE_L3B_EN, OUTPUT);
     ioe.pinMode(IOE_TP_RST, OUTPUT);
+    ioe.pinMode(IOE_SPK_PA, OUTPUT);
     ioe.digitalWrite(IOE_AU_EN,  1);   // audio power on
     ioe.digitalWrite(IOE_L3B_EN, 1);   // upstream rail latch
+    // SPK_PA must stay LOW here — UserDemo enables it AFTER the codec is open,
+    // otherwise the AW8737A power amp can latch into a bad state.
+    ioe.digitalWrite(IOE_SPK_PA, 0);
+    gpio_set_direction(SPK_PA_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(SPK_PA_PIN, 0);
     // Pulse touch reset low → high (matches UserDemo hal_ioe ioe_tp_reset).
     ioe.digitalWrite(IOE_TP_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -167,6 +179,10 @@ static void init_codec() {
     g_codec_dev = esp_codec_dev_new(&dev_cfg);
 
     esp_codec_dev_set_in_gain(g_codec_dev, 30.0);
+    // Output volume defaults to 0 on this codec — without this, chime writes
+    // succeed but no audible signal reaches the speaker.
+    esp_codec_dev_set_out_vol(g_codec_dev, 100.0);
+    esp_codec_dev_set_out_mute(g_codec_dev, false);
 
     esp_codec_dev_sample_info_t fs = {};
     fs.bits_per_sample = 16;
@@ -179,6 +195,23 @@ static void init_codec() {
 static bool s_recording = false;
 static bool s_sleeping = false;
 static int64_t s_last_activity_us = 0;
+// Updated by battery_task every 10s. When plugged in, we keep the screen on
+// indefinitely; only on battery do we idle-sleep after IDLE_SLEEP_US.
+static volatile bool s_on_usb_power = false;
+// 0 = no pending; otherwise = ms timestamp of the first press, waiting to see
+// if a second press arrives within the double-click window (then it becomes a clear).
+static uint32_t s_btn_b_pending_submit_ms = 0;
+
+// Exposed to chime.cpp so it can skip playing while the mic is in use.
+extern "C" bool is_recording_getter(void) { return s_recording; }
+
+// Exposed to chime.cpp so it can power-cycle the AW8737A PA around each chime.
+// Keeping the PA on between chimes amplifies idle hiss / DMA-loop residue, which
+// sounds like continuous ticking.
+extern "C" void speaker_pa_set(bool on) {
+    ioe.digitalWrite(IOE_SPK_PA, on ? 1 : 0);
+    gpio_set_level(SPK_PA_PIN, on ? 1 : 0);
+}
 
 static void note_activity() {
     s_last_activity_us = esp_timer_get_time();
@@ -195,6 +228,9 @@ static bool wake_if_sleeping() {
 
 static void maybe_enter_idle_sleep() {
     if (s_sleeping || s_recording || s_last_activity_us == 0) return;
+    // Plugged in → never auto-sleep. Power isn't the constraint; staying lit
+    // is more useful (watch on a desk, dashboard always visible).
+    if (s_on_usb_power) return;
     int64_t now = esp_timer_get_time();
     if (now - s_last_activity_us >= IDLE_SLEEP_US) {
         s_sleeping = true;
@@ -303,6 +339,7 @@ static void battery_task(void*) {
         }
         // Vin > ~4500 mV means USB power is present → charging.
         bool charging = vin >= 4500;
+        s_on_usb_power = charging;
         ui_set_battery(pct, charging);
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
@@ -345,15 +382,33 @@ static void mic_task(void*) {
             ui_set_recording(false);
             ESP_LOGI(TAG, "<< recording stop");
         }
+        // Button B: single press → submit (Enter), double press → clear (Cmd+A+Delete).
+        // We delay sending "submit" by DOUBLE_WINDOW_MS so a follow-up press can override
+        // it. Side effect: single Enter has ~300ms latency, which is barely noticeable.
+        constexpr uint32_t DOUBLE_WINDOW_MS = 300;
+        const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         if (button_b_just_pressed()) {
             wake_if_sleeping();
             note_activity();
-            // Tell Mac to hit Enter on whatever the active window is.
-            ws_send_text("{\"type\":\"submit\"}");
-            ESP_LOGI(TAG, "B pressed -> submit");
+            if (s_btn_b_pending_submit_ms != 0
+                && (now_ms - s_btn_b_pending_submit_ms) <= DOUBLE_WINDOW_MS) {
+                // Second press within the window — cancel pending submit, send clear.
+                s_btn_b_pending_submit_ms = 0;
+                ws_send_text("{\"type\":\"clear\"}");
+                ESP_LOGI(TAG, "B double -> clear");
+            } else {
+                // First press — arm a delayed submit. Fires below if no second press.
+                s_btn_b_pending_submit_ms = now_ms;
+            }
         }
         if (button_b_just_released()) {
             note_activity();
+        }
+        if (s_btn_b_pending_submit_ms != 0
+            && (now_ms - s_btn_b_pending_submit_ms) > DOUBLE_WINDOW_MS) {
+            s_btn_b_pending_submit_ms = 0;
+            ws_send_text("{\"type\":\"submit\"}");
+            ESP_LOGI(TAG, "B single -> submit");
         }
         if (button_a_pressed() || button_b_pressed()) {
             note_activity();
@@ -426,7 +481,11 @@ extern "C" void app_main() {
 
     init_i2s();
     init_codec();
+    // PA stays OFF at boot; chime task power-cycles it for each chime so the
+    // amp isn't continuously amplifying idle DMA noise.
+    chime_init(g_codec_dev, is_recording_getter, speaker_pa_set);
     buttons_init();
+
 
     // Enable mDNS so the lwIP resolver can turn `.local` hostnames into IPs.
     // Without this, `gethostbyname("Ethan-MacBook-Air.local")` fails and the

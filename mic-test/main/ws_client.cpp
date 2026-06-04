@@ -1,5 +1,6 @@
 #include "ws_client.h"
 #include "display.h"
+#include "chime.h"
 #include <string.h>
 #include <stdlib.h>
 #include "esp_log.h"
@@ -39,6 +40,18 @@ static void ws_send_task(void* /*arg*/) {
 static void handle_state_json(const char* payload, int len) {
     cJSON* root = cJSON_ParseWithLength(payload, len);
     if (!root) return;
+
+    // One-off control messages (no state poll): {"type":"chime","agent":"claude|codex"}.
+    cJSON* type = cJSON_GetObjectItem(root, "type");
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "chime") == 0) {
+        cJSON* agent = cJSON_GetObjectItem(root, "agent");
+        if (cJSON_IsString(agent)) {
+            if      (strcmp(agent->valuestring, "claude") == 0) chime_play_claude_done();
+            else if (strcmp(agent->valuestring, "codex")  == 0) chime_play_codex_done();
+        }
+        cJSON_Delete(root);
+        return;
+    }
 
     cJSON* model = cJSON_GetObjectItem(root, "model");
     if (cJSON_IsString(model)) ui_set_model(model->valuestring);

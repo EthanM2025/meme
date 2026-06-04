@@ -31,7 +31,7 @@ except ImportError:
 
 from doubao_asr import transcribe_wav
 from doubao_streaming import StreamingASRSession
-from paste import paste_to_active_window, get_active_app, press_enter
+from paste import paste_to_active_window, get_active_app, press_enter, clear_input
 from claude_adapter import get_state as get_claude_state
 from codex_adapter import get_state as get_codex_state, daemon_loop as codex_activity_daemon
 import threading
@@ -47,6 +47,70 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # Latest ASR transcript — picked up by push_state_loop and shipped to the device.
 _last_transcript = ""
+
+
+def _tail_text(path: str, max_bytes: int = 512 * 1024) -> str:
+    """Read the end of a rollout JSONL without loading huge sessions."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes), os.SEEK_SET)
+        return f.read().decode("utf-8", errors="ignore")
+
+
+def _read_codex_completion_signal() -> Optional[str]:
+    """Return Codex's latest native task-complete marker from session rollouts.
+
+    Codex Desktop/CLI persists each thread's event stream in rollout JSONL files,
+    and completed turns include an `event_msg` payload with type `task_complete`.
+    This is the same native completion surface that feeds app notifications, and
+    avoids noisy background activity writes that are unrelated to turn completion.
+    """
+    try:
+        import pathlib
+        import sqlite3
+
+        state_path = pathlib.Path.home() / ".codex" / "state_5.sqlite"
+        if not state_path.exists():
+            return None
+        conn = sqlite3.connect(f"file:{state_path}?mode=ro", uri=True, timeout=1.0)
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, rollout_path
+                  FROM threads
+                 WHERE model_provider = 'openai'
+                   AND rollout_path IS NOT NULL
+                   AND (thread_source IS NULL OR thread_source != 'subagent')
+                 ORDER BY updated_at_ms DESC
+                 LIMIT 8
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        best_signal = None
+        best_ts = ""
+        for thread_id, rollout_path in rows:
+            if not rollout_path or not os.path.exists(rollout_path):
+                continue
+            for line in reversed(_tail_text(rollout_path).splitlines()):
+                try:
+                    obj = _json.loads(line)
+                except Exception:
+                    continue
+                payload = obj.get("payload") if isinstance(obj, dict) else None
+                if not isinstance(payload, dict) or payload.get("type") != "task_complete":
+                    continue
+                ts = obj.get("timestamp") or ""
+                signal = f"{thread_id}:{ts}"
+                if ts >= best_ts:
+                    best_ts = ts
+                    best_signal = signal
+                break
+        return best_signal
+    except Exception:
+        return None
 
 
 def rms_int16(b: bytes) -> int:
@@ -102,7 +166,18 @@ async def push_state_loop(ws):
 
     Both adapters touch disk / spawn subprocesses, so run them in a thread
     pool to avoid hijacking the event loop (which would stall WS frame I/O).
+
+    Also fires a one-off `chime` message whenever Claude/Codex write their
+    native task-complete markers, so the device can ding when a task wraps up.
     """
+    # Per-connection state (one client at a time today, but scope it anyway).
+    # Chime fires when the timestamp of Claude's most recent `stop_reason==end_turn`
+    # message changes — that's the native "task complete" signal, so no heuristics.
+    last_seen_end_turn_ts: str | None = None
+    # Codex chime keys off rollout `task_complete`, not background activity.
+    last_seen_codex_done: str | None = None
+    codex_done_initialized = False
+
     while True:
         try:
             claude = await asyncio.to_thread(get_claude_state)
@@ -189,6 +264,27 @@ async def push_state_loop(ws):
                 "transcript":               "",
             }
             await ws.send(_json.dumps(payload))
+
+            # Fire Claude chime ONLY when end_turn ts moves STRICTLY FORWARD.
+            # claude_adapter picks "latest JSONL" by mtime, which can flip between
+            # multiple active sessions — that made ts go backwards between polls
+            # and we re-chimed. ISO timestamps sort lexicographically so plain >.
+            cur_end_turn_ts = claude.get("last_end_turn_ts")
+            if last_seen_end_turn_ts is None:
+                last_seen_end_turn_ts = cur_end_turn_ts
+            elif cur_end_turn_ts and cur_end_turn_ts > last_seen_end_turn_ts:
+                await ws.send(_json.dumps({"type": "chime", "agent": "claude"}))
+                print(f"[{time.strftime('%H:%M:%S')}] 🔔 claude done ({cur_end_turn_ts})")
+                last_seen_end_turn_ts = cur_end_turn_ts
+
+            cur_codex_done = await asyncio.to_thread(_read_codex_completion_signal)
+            if not codex_done_initialized:
+                last_seen_codex_done = cur_codex_done
+                codex_done_initialized = True
+            elif cur_codex_done and cur_codex_done != last_seen_codex_done:
+                await ws.send(_json.dumps({"type": "chime", "agent": "codex"}))
+                print(f"[{time.strftime('%H:%M:%S')}] 🔔 codex done ({cur_codex_done})")
+                last_seen_codex_done = cur_codex_done
         except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
             return
         except Exception as e:
@@ -264,6 +360,10 @@ async def handler(ws):
                 elif t == "submit":
                     print(f"[{time.strftime('%H:%M:%S')}] ↩ submit -> Enter")
                     press_enter()
+                    continue
+                elif t == "clear":
+                    print(f"[{time.strftime('%H:%M:%S')}] ✗ clear -> Cmd+A + Delete")
+                    clear_input()
                     continue
                 elif t == "end":
                     if wf is not None:
